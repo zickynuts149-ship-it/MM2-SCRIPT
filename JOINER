@@ -1,31 +1,22 @@
 --[[
-	Server Share - JOINER
+	Trade - JOINER
 
-	Run this in any game (or the same game) to be dropped into the server that
-	whoever is running host.lua is in.
+	Run this in the same Roblox server as the person running host.lua. Nothing
+	joins anybody: both of you are already here.
 
-	What it does
-	  1. Asks the same public relay (ntfy.sh) that host.lua uses "is anybody
-	     hosting?" and only follows a host that answers right now. A leftover
-	     announcement from a dead server - or your own earlier session - can
-	     never send you anywhere, so with nobody hosting this waits quietly.
-	  2. Announces your own username on the "<server topic>_players" topic and
-	     then calls TeleportToPlaceInstance, which puts this client into that
-	     exact server. That announcement is how the host learns who is coming.
-	  3. Queues the session script, which runs in the server you land in and
-	     does your half of every trade:
-	       - the host's request arrives      -> 2 s later accept the request
-	       - the host says its items are in -> 6 s later press accept
-	       - both sides press accept        -> press confirm 1 s later
-	  4. When the host says it is finished, the session goes back to hunting and
-	     follows the next host, arming a fresh session before every teleport.
+	What this side does, every cycle:
+	  1. Takes the other player in this server as the host - no handshake, no
+	     waiting for the relay to say who is who (CONFIG.HOST overrides it).
+	  2. Sees the trade request in its own UI (or hears about it on the relay),
+	     and fires Trade.AcceptRequest 1s later.
+	  3. Watches its own trade window for the host's items, then presses accept 1s
+	     after the host's moment (6s after the last item), checks the game really
+	     took it, and confirms 1s later.
+	  4. Hears that the host is finished, or notices that it went quiet.
 
-	Both scripts need the same ROOM, and each side reports what it just did on a
-	third topic ("<server topic>_sync") so neither one has to guess.
-
-	The card shows what it found and can be stopped at any time.
-
-	Read the notes next to this file for setup and limits.
+	The trade window is never hidden, disabled or deleted by this script.
+	Nothing here waits for a relay message to move on: the relay is a helper,
+	and every step is timed off the trade window and the clock.
 ]]
 
 --------------------------------------------------------------------------
@@ -33,198 +24,48 @@
 --------------------------------------------------------------------------
 
 local CONFIG = {
-	-- Must match ROOM in host.lua. Change it to a private code.
+	-- Must match ROOM in host.lua.
 	ROOM = "fbshare1",
 
 	-- Message relay. ntfy.sh needs no signup.
 	RELAY_URL = "https://ntfy.sh",
 
-	-- How often to ask the relay for a host while waiting for one. ntfy.sh
-	-- refills its request allowance once every 10 seconds, so going faster
-	-- just gets throttled.
-	POLL_SECONDS = 10,
-
-	-- nil -> follow whoever published last. Set to a DisplayName or username
-	-- to only follow that one person.
+	-- nil -> the host is the other player in this server. Set to a Roblox
+	-- username to only ever talk to that person.
 	HOST = nil,
 
-	-- true -> teleport by itself the moment it finds the server.
-	AUTO_JOIN = true,
-
-	-- Run the trading session in the server you land in: accept the host's
-	-- request, accept and confirm the trade, then look for the next host.
-	-- Needs an executor that exposes queue_on_teleport; when it is missing this
-	-- is skipped with a console message instead of failing.
-	RUN_SESSION_AFTER_JOIN = true,
-
-	-- Attempts per Job ID, and seconds between attempts.
-	MAX_ATTEMPTS = 2,
-	RETRY_SECONDS = 15,
-
 	-- The trade handshake, in seconds. host.lua uses the same numbers.
-	REQUEST_ACCEPT_DELAY = 2,     -- the request arrived -> AcceptRequest
-	ACCEPT_DELAY_SECONDS = 6,     -- host says its items are in -> press accept
-	CONFIRM_DELAY_SECONDS = 1,    -- press accept -> press confirm
-	ITEMS_FALLBACK_SECONDS = 8,   -- no word from the host -> use this timer
-	ACK_WAIT_SECONDS = 15,        -- how long to wait for the host's event
-	SYNC_POLL_SECONDS = 2,        -- how often the sync topic is read
-	REQUEST_TIMEOUT_SECONDS = 75, -- how long to wait for the next request
-	WINDOW_WAIT_SECONDS = 8,      -- how long the trade window may take to open
+	REQUEST_ACCEPT_DELAY = 1,      -- the request arrived -> AcceptRequest
+	ACCEPT_DELAY_SECONDS = 6,      -- the host's last item landed -> accept
+	ACCEPT_GO_DELAY_SECONDS = 1,   -- the host said "accept now" -> press accept
+	CONFIRM_DELAY_SECONDS = 1,     -- press accept -> press confirm
+	ITEMS_WAIT_SECONDS = 12,       -- longest wait for the host's items to land
+	-- The link: the same transport the ServerChat script uses. The channel name
+	-- comes from this server's JobId, so only clients in THIS server hear each
+	-- other. ntfy.sh allows 60 requests as a burst, then about one per 10s.
+	LINK_POLL_SECONDS = 10,        -- how often the channel is read
+	LINK_START_POLL_SECONDS = 1.5,   -- during the first moments: fast, so CONNECTED happens at once
+	LINK_START_POLL_WINDOW = 20,   -- how long that fast pace lasts
+	LINK_MAX_POLL_SECONDS = 25,    -- the most it backs off to while the relay refuses
+	LINK_HELLO_SECONDS = 12,       -- how often to say hello until the host's script answers
+	LINK_HELLO_RETRY_SECONDS = 4,  -- a refused hello is retried this soon
+	LINK_KEEPALIVE_SECONDS = 60,   -- how often after that
+	WINDOW_WAIT_SECONDS = 8,       -- how long the trade window may take to open
 }
 
---------------------------------------------------------------------------
--- Services and small helpers
---------------------------------------------------------------------------
+-- Trade - JOINER (runs on the joiner's client)
 
 local Players = game:GetService("Players")
-local TeleportService = game:GetService("TeleportService")
-local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local localPlayer = Players.LocalPlayer
+local waitFn = (task and task.wait) or wait
+local spawnFn = (task and task.spawn) or spawn
 
-local function waitSeconds(seconds)
-	if task and task.wait then
-		return task.wait(seconds)
-	end
-	return wait(seconds)
-end
-
-local function spawnThread(fn)
-	if task and task.spawn then
-		return task.spawn(fn)
-	end
-	return spawn(fn)
-end
-
-local function safeField(container, key)
-	if container == nil then
-		return nil
-	end
-	if type(container) ~= "table" and typeof(container) ~= "Instance" and type(container) ~= "userdata" then
-		return nil
-	end
-	local ok, value = pcall(function()
-		return container[key]
-	end)
-	if ok then
-		return value
-	end
-	return nil
-end
-
-local function cleanText(text, maxLength)
-	if type(text) ~= "string" then
-		return ""
-	end
-	text = text:gsub("[%c]", " ")
-	text = text:gsub("|", "/")
-	text = text:gsub("%s+", " ")
-	text = text:gsub("^%s+", "")
-	text = text:gsub("%s+$", "")
-	if maxLength and #text > maxLength then
-		text = text:sub(1, maxLength - 1) .. "..."
-	end
-	return text
-end
-
-local function toHex(text)
-	return (tostring(text):gsub(".", function(char)
-		return string.format("%02x", string.byte(char))
+local function decode(hex)
+	return (hex:gsub("%x%x", function(byte)
+		return string.char(tonumber(byte, 16))
 	end))
 end
-
---------------------------------------------------------------------------
--- HTTP bridge (executors expose this under different names)
---------------------------------------------------------------------------
-
-local function urlEncode(value)
-	return (tostring(value):gsub("[^%w%-%._~]", function(char)
-		return string.format("%%%02X", string.byte(char))
-	end))
-end
-
-local httpRequest
-for _, candidate in ipairs({
-	safeField(syn, "request"),
-	safeField(http, "request"),
-	safeField(fluxus, "request"),
-	safeField(krnl, "request"),
-	rawget(_G, "http_request"),
-	rawget(_G, "request"),
-}) do
-	if type(candidate) == "function" then
-		httpRequest = candidate
-		break
-	end
-end
-
--- Returns: ok (boolean, HTTP 2xx), status code, body
-local function http(url, method, body, headers)
-	if httpRequest then
-		local sent, response = pcall(httpRequest, {
-			Url = url,
-			Method = method or "GET",
-			Headers = headers or {},
-			Body = body,
-		})
-		if not sent then
-			return false, 0, tostring(response)
-		end
-		if type(response) == "string" then
-			return true, 200, response
-		end
-		if type(response) ~= "table" then
-			return false, 0, "unexpected executor response"
-		end
-		local status = tonumber(response.StatusCode or response.Status or response.status or response.statusCode or response.code) or 0
-		local responseBody = response.Body or response.body or ""
-		if type(responseBody) ~= "string" then
-			responseBody = tostring(responseBody)
-		end
-		return status >= 200 and status < 300, status, responseBody
-	end
-
-	if method == nil or method == "GET" then
-		local ok, response = pcall(function()
-			return game:HttpGet(url)
-		end)
-		if ok and type(response) == "string" then
-			return true, 200, response
-		end
-		return false, 0, tostring(response)
-	end
-
-	return false, 0, "this executor does not support HTTP requests"
-end
-
-local httpAvailable = httpRequest ~= nil
-if not httpAvailable then
-	local ok, getter = pcall(function()
-		return game.HttpGet
-	end)
-	httpAvailable = ok and type(getter) == "function"
-end
-
-local function copyToClipboard(text)
-	local environment = type(getgenv) == "function" and getgenv() or _G
-	for _, name in ipairs({ "setclipboard", "toclipboard" }) do
-		local fn = rawget(environment, name)
-		if type(fn) == "function" then
-			local ok = pcall(fn, text)
-			if ok then
-				return true
-			end
-		end
-	end
-	return false
-end
-
---------------------------------------------------------------------------
--- Room, topics and who you are
---
--- These come before the post-teleport template because that template is
--- built from them; a local declared further down would be invisible here.
---------------------------------------------------------------------------
 
 local function sanitizeRoom(raw)
 	local cleaned = tostring(raw or ""):lower():gsub("[^%w_%-]", "")
@@ -237,112 +78,23 @@ local function sanitizeRoom(raw)
 	return cleaned
 end
 
-local room = sanitizeRoom(CONFIG.ROOM)
-local topic = "fbshare_" .. room
-local presenceTopic = topic .. "_players"
-local syncTopic = topic .. "_sync"
 local relayBase = tostring(CONFIG.RELAY_URL):gsub("/+$", "")
 
--- Filled in as soon as a host is picked. The session script that runs in the
--- host's server bakes both of them in.
+-- Filled in from the Players list below, before anything is addressed.
 local hostUsername = ""
 local hostDisplay = ""
 
--- Your exact Roblox username. This is what the host trades with, so it is sent
--- as-is and never derived from the display name.
-local myUsername = cleanText(tostring(localPlayer.Name or ""), 40)
-if myUsername == "" then
-	myUsername = "Unknown player"
-end
-local myDisplay = cleanText(tostring(localPlayer.DisplayName or localPlayer.Name or ""), 40)
-if myDisplay == "" then
-	myDisplay = myUsername
-end
+-- Written into the console when the session starts, so it is obvious which
+-- copy of the script is really running in the server.
+local BUILD = "v4"
 
---------------------------------------------------------------------------
--- Running code after the teleport
---------------------------------------------------------------------------
+local REQUEST_DELAY = CONFIG.REQUEST_ACCEPT_DELAY
+local ITEMS_WAIT = CONFIG.ITEMS_WAIT_SECONDS
+local ACCEPT_DELAY = CONFIG.ACCEPT_DELAY_SECONDS
+local ACCEPT_GO_DELAY = CONFIG.ACCEPT_GO_DELAY_SECONDS
+local CONFIRM_DELAY = CONFIG.CONFIRM_DELAY_SECONDS
+local WINDOW_WAIT = CONFIG.WINDOW_WAIT_SECONDS
 
--- queue_on_teleport is added by the executor, not by Roblox. It stores a
--- string of Lua source and runs it in the next server this client joins.
--- The game's Lua environment is destroyed by a teleport, so this queue is the
--- only way to get a script running on the other side.
-local function findQueueOnTeleport()
-	local containers = { _G }
-	if type(getgenv) == "function" then
-		local ok, environment = pcall(getgenv)
-		if ok and type(environment) == "table" and environment ~= _G then
-			containers[#containers + 1] = environment
-		end
-	end
-	for _, globalName in ipairs({ "syn", "fluxus", "krnl", "http" }) do
-		local container = rawget(_G, globalName)
-		if container ~= nil and container ~= _G then
-			containers[#containers + 1] = container
-		end
-	end
-	for _, name in ipairs({ "queue_on_teleport", "queueonteleport", "queue_teleport" }) do
-		for _, container in ipairs(containers) do
-			local fn = safeField(container, name)
-			if type(fn) == "function" then
-				return fn, name
-			end
-		end
-	end
-	return nil, nil
-end
-
-local queueOnTeleport, queueName = findQueueOnTeleport()
-
---------------------------------------------------------------------------
--- The script that runs inside the host's server
---
--- Everything it needs is baked in as hex or as a number: this environment does
--- not exist any more after the teleport, so the queued copy has to be
--- completely self-contained.
---
--- Its job:
---   * see the host's trade request, wait 2 s, fire AcceptRequest
---   * wait until the host says the items are in
---   * 6 s after that press accept, tell the host, confirm once the host has
---     accepted too
---   * when the host says it is done, go back to hunting for another host
---------------------------------------------------------------------------
-
-local SESSION_TEMPLATE = [====[
--- Server Share - SESSION (runs inside the host's server)
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TeleportService = game:GetService("TeleportService")
-
-local waitFn = (task and task.wait) or wait
-local spawnFn = (task and task.spawn) or spawn
-
-local function decode(hex)
-	return (hex:gsub("%x%x", function(byte)
-		return string.char(tonumber(byte, 16))
-	end))
-end
-
-local relayBase = decode("__RELAY_HEX__")
-local syncTopic = decode("__SYNC_TOPIC_HEX__")
-local serverTopic = decode("__SERVER_TOPIC_HEX__")
-local hostUsername = decode("__HOST_USER_HEX__")
-local hostDisplay = decode("__HOST_DISPLAY_HEX__")
-local bakedJob = decode("__JOB_HEX__")
-local nextGeneration = decode("__SPARE_HEX__")
-
-local REQUEST_DELAY = __REQUEST_DELAY__
-local ITEMS_FALLBACK = __ITEMS_FALLBACK__
-local ACCEPT_DELAY = __ACCEPT_DELAY__
-local CONFIRM_DELAY = __CONFIRM_DELAY__
-local ACK_WAIT = __ACK_WAIT__
-local SYNC_POLL = __SYNC_POLL__
-local REQUEST_TIMEOUT = __REQUEST_TIMEOUT__
-local WINDOW_WAIT = __WINDOW_WAIT__
-
-local presenceTopic = serverTopic .. "_players"
 
 local function now()
 	if type(tick) == "function" then
@@ -463,117 +215,418 @@ pcall(function()
 	playerGui = me:WaitForChild("PlayerGui", 20)
 end)
 
-print("[Server Share] you are " .. myDisplay .. " (@" .. myUsername .. ")")
-print("[Server Share] host of this server: " .. hostDisplay .. " (@" .. hostUsername .. ")")
-print(string.format("[Server Share] place %s, job %s", tostring(myPlace), myJob))
-print("[Server Share] waiting for the host's trade request")
+print("[Trade] session " .. BUILD .. " for " .. myDisplay .. " (@" .. myUsername .. ")")
+print(string.format("[Trade] place %s, job %s", tostring(myPlace), myJob))
 
---------------------------------------------------------------------------
--- The sync topic
---------------------------------------------------------------------------
-
-local sync = { events = {} }
-local finished = false
-
-local function publish(event, cycle, payload)
-	local body = table.concat({
-		"s1",
-		cleanText(tostring(event), 16),
-		tostring(myPlace),
-		cleanText(myJob, 100),
-		tostring(tonumber(cycle) or 0),
-		cleanText(tostring(payload or ""), 60),
-		cleanText(hostUsername, 40),
-		cleanText(myUsername, 40),
-		tostring(os.time()),
-	}, "|")
-	local ok, status = httpSend(relayBase .. "/" .. syncTopic, "POST", body)
-	if not ok then
-		print("[Server Share] could not send '" .. tostring(event) .. "' (error " .. tostring(status) .. ")")
+-- Only one session may act in a server. Some executors run joiner.lua again
+-- after a teleport, and two sessions would both press accept - the second
+-- press cancels the first and the trade then closes as if it was declined.
+do
+	local containers = { _G }
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" and env ~= _G then
+			containers[#containers + 1] = env
+		end
 	end
-	return ok
+	local guardKey = "ServerShareSession_" .. tostring(myJob)
+	for _, container in ipairs(containers) do
+		if type(container) == "table" and container[guardKey] then
+			print("[Trade] another session is already running in this server - this copy stops here")
+			return
+		end
+	end
+	for _, container in ipairs(containers) do
+		if type(container) == "table" then
+			container[guardKey] = true
+		end
+	end
 end
 
-local function decodeSync(text)
+print("[Trade] waiting for the host's trade request")
+
+--------------------------------------------------------------------------
+-- The link to the host
+--
+-- This is the ServerChat transport, used exactly the way it is used there:
+--
+--   * Both clients work out the SAME channel name from this server's JobId
+--     (with ROOM as the salt). Two people in different servers therefore never
+--     see each other, and nothing left over from an older server is read.
+--   * A message is one line, its fields separated by \1:
+--       V1 | kind | clientId | username | displayName | cycle | event | payload | stamp
+--   * It is published with  POST <relay>/<channel>  and read back with
+--       GET <relay>/<channel>/json?poll=1&since=<last id seen>
+--     The cursor starts at "3m" (recent history) and afterwards only moves
+--     to ids that actually came back, so a read only ever returns what is new.
+--   * A line is believed only when its sender is a player standing in this
+--     server right now - the same check ServerChat makes - so somebody else
+--     using the relay is ignored.
+--
+-- It tells this side who the host is and that its script is really running,
+-- and it carries each step of the trade as a hint. No step waits for a
+-- message: the trade window and the clock run the cycle, so a slow, busy or
+-- dead relay costs a log line, not a trade.
+--------------------------------------------------------------------------
+
+local SEP = string.char(1)
+
+-- A fresh id every run, like ServerChat's clientId.
+math.randomseed(os.time() + math.floor((os.clock and os.clock() or 0) * 1000000))
+local function randomId(length)
+	local pool = "abcdefghijklmnopqrstuvwxyz0123456789"
+	local out = {}
+	for i = 1, length do
+		local k = math.random(1, #pool)
+		out[i] = pool:sub(k, k)
+	end
+	return table.concat(out)
+end
+
+local clientId = randomId(12)
+
+local function hash32(text)
+	local h = 5381
+	for i = 1, #text do
+		h = (h * 33 + string.byte(text, i)) % 4294967296
+	end
+	return h
+end
+
+-- 32-bit hash printed as eight hex digits. Written out by hand so it works
+-- the same in every Lua (no %x needed).
+local function hex32(value)
+	local digits = "0123456789abcdef"
+	local out = {}
+	local n = math.floor(value or 0) % 4294967296
+	for i = 1, 8 do
+		local d = n % 16
+		out[9 - i] = digits:sub(d + 1, d + 1)
+		n = math.floor((n - d) / 16)
+	end
+	return table.concat(out)
+end
+
+local function buildChannel()
+	local jobId = myJob
+	if jobId == "" then
+		-- JobId is normally readable on the client; without it, the place alone
+		-- still gives a working channel.
+		jobId = "noplace" .. tostring(myPlace)
+	end
+	local seed = sanitizeRoom(CONFIG.ROOM) .. "|" .. tostring(myPlace) .. "|" .. jobId
+	return "rbxshare" .. hex32(hash32(seed)) .. hex32(hash32(seed .. "#2"))
+end
+
+local channel = buildChannel()
+local channelCode = channel:sub(-6):upper()
+local publishUrl = relayBase .. "/" .. channel
+local pollUrlBase = publishUrl .. "/json?poll=1&since="
+
+-- Split on \1 and keep empty fields: a payload may be empty.
+local function splitFields(raw)
+	local fields = {}
+	local start = 1
+	while true do
+		local found, last = string.find(raw, SEP, start, true)
+		if not found then
+			fields[#fields + 1] = string.sub(raw, start)
+			return fields
+		end
+		fields[#fields + 1] = string.sub(raw, start, found - 1)
+		start = last + 1
+	end
+end
+
+local function encodeMessage(kind, cycle, event, payload)
+	return table.concat({
+		"V1",
+		cleanText(tostring(kind or ""), 8),
+		clientId,
+		cleanText(myUsername, 40),
+		cleanText(myDisplay, 40),
+		tostring(tonumber(cycle) or 0),
+		cleanText(tostring(event or ""), 16),
+		cleanText(tostring(payload or ""), 60),
+		tostring(os.time()),
+	}, SEP)
+end
+
+local function decodeMessage(text)
 	if type(text) ~= "string" then
 		return nil
 	end
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 9 or parts[1] ~= "s1" then
+	local parts = splitFields(text)
+	if #parts ~= 9 or parts[1] ~= "V1" then
 		return nil
 	end
-	local place = tonumber(parts[3])
-	local cycle = tonumber(parts[5])
+	local cycle = tonumber(parts[6])
 	local stamp = tonumber(parts[9])
-	if not place or place <= 0 or not cycle or not stamp then
+	if cycle == nil or stamp == nil then
 		return nil
 	end
 	return {
-		event = cleanText(parts[2], 16),
-		place = place,
-		job = parts[4],
+		kind = cleanText(parts[2], 8),
+		from = parts[3],
+		username = cleanText(parts[4], 40),
+		display = cleanText(parts[5], 40),
 		cycle = cycle,
-		payload = cleanText(parts[6], 60),
-		host = cleanText(parts[7], 40),
-		joiner = cleanText(parts[8], 40),
+		event = cleanText(parts[7], 16),
+		payload = cleanText(parts[8], 60),
 		stamp = stamp,
 	}
 end
 
-local function pollSync()
-	local ok, status, body = httpSend(relayBase .. "/" .. syncTopic .. "/raw?poll=1&since=10m", "GET")
-	if not ok then
-		if status == 429 then
-			waitFn(5)
-		end
-		return
+-- The smallest JSON reader that is enough for ntfy's one-object-per-line
+-- replies (the same one ServerChat uses).
+local function jsonString(line, key)
+	local needle = '"' .. key .. '":"'
+	local start = line:find(needle, 1, true)
+	if not start then
+		return nil
 	end
-
-	local wantedHost = hostUsername:lower()
-	local wantedMe = myUsername:lower()
-
-	for line in tostring(body):gmatch("[^\r\n]+") do
-		local entry = decodeSync(line)
-		if entry
-			and entry.place == myPlace
-			and entry.job == myJob
-			and entry.host:lower() == wantedHost
-			and entry.joiner:lower() == wantedMe
-		then
-			if entry.event == "done" then
-				finished = true
+	local i = start + #needle
+	local out = {}
+	while i <= #line do
+		local char = line:sub(i, i)
+		if char == "\\" then
+			local nextChar = line:sub(i + 1, i + 1)
+			if nextChar == "u" then
+				local code = tonumber(line:sub(i + 2, i + 5), 16)
+				if code and code <= 0x10FFFF and not (code >= 0xD800 and code <= 0xDFFF) then
+					out[#out + 1] = utf8.char(code)
+				else
+					out[#out + 1] = "?"
+				end
+				i = i + 6
+			elseif nextChar == "n" then
+				out[#out + 1] = "\n"
+				i = i + 2
+			elseif nextChar == "t" then
+				out[#out + 1] = "\t"
+				i = i + 2
+			elseif nextChar == "r" then
+				out[#out + 1] = "\r"
+				i = i + 2
+			else
+				out[#out + 1] = nextChar
+				i = i + 2
 			end
-			local current = sync.events[entry.event]
-			if current == nil or entry.cycle >= current.cycle then
-				sync.events[entry.event] = entry
-			end
+		elseif char == '"' then
+			return table.concat(out)
+		else
+			out[#out + 1] = char
+			i = i + 1
 		end
 	end
+	return table.concat(out)
 end
 
-spawnFn(function()
-	while not finished do
-		pollSync()
-		waitFn(SYNC_POLL)
-	end
-end)
+local sync = {
+	started = false,
+	startedAt = 0,
+	polling = false,
+	connected = false,
+	connectedAt = 0,
+	peerUsername = "",
+	peerDisplay = "",
+	peerAckedAt = 0,
+	events = {},
+	cursor = "3m",
+	answered = false,
+	trouble = 0,
+	lastError = nil,
+	lastNoteAt = 0,
+	lastHelloAt = -1e9,  -- so the first hello goes out at once
+	lastHelloFailed = false,
+}
 
-local function waitFor(event, cycle, timeoutSeconds)
-	local deadline = now() + timeoutSeconds
-	while not finished do
-		local entry = sync.events[event]
-		if entry ~= nil and entry.cycle >= cycle then
-			return true
-		end
-		if now() >= deadline then
-			return false
-		end
-		waitFn(0.25)
+local finished = false
+
+local function linkState()
+	if sync.connected then
+		return "linked with " .. (sync.peerDisplay ~= "" and sync.peerDisplay or sync.peerUsername)
+	elseif sync.answered then
+		return "relay answering, waiting for the host's script"
+	elseif sync.trouble > 0 then
+		return "relay busy - trading on the clock"
 	end
-	return false
+	return "relay starting"
+end
+
+-- ntfy.sh allows 60 requests as a burst, then about one per 10 seconds, for a
+-- whole network. Both clients share that, so polls are spaced out and the Polls are spaced out, and the optional per-step messages only go
+-- out when this bucket has a token, so several busy cycles cannot drain the
+-- allowance. The two that matter - the request and "finished" - always go out.
+local bucket = { tokens = 4, burst = 4, perToken = 12, at = now() }
+
+local function takeToken()
+	local at = now()
+	while bucket.tokens < bucket.burst and at - bucket.at >= bucket.perToken do
+		bucket.tokens = bucket.tokens + 1
+		bucket.at = bucket.at + bucket.perToken
+	end
+	if bucket.tokens <= 0 then
+		return false
+	end
+	bucket.tokens = bucket.tokens - 1
+	return true
+end
+
+local function publishMessage(kind, cycle, event, payload)
+	local forced = kind == "hello" or kind == "ack" or event == "req" or event == "done"
+	if not forced and not takeToken() then
+		return false
+	end
+	local ok, status = httpSend(publishUrl, "POST", encodeMessage(kind, cycle, event, payload))
+	if not ok and now() - sync.lastNoteAt > 60 then
+		sync.lastNoteAt = now()
+		print("[Trade] the relay did not take a message (" .. tostring(status) .. ") - the trade keeps its own clock")
+	end
+	return ok
+end
+
+-- Call sites below address the host by name. The channel is already this
+-- server only, so the name stays in the log and off the wire.
+local function publish(event, cycle, payload)
+	return publishMessage("trade", cycle, event, payload)
+end
+
+local function publishSync(event, toUsername, cycle, payload)
+	return publishMessage("trade", cycle, event, payload)
+end
+
+local function notePeer(entry)
+	local first = not sync.connected
+	sync.peerUsername = entry.username
+	sync.peerDisplay = entry.display ~= "" and entry.display or entry.username
+	-- The link is also how this side learns who to listen to when the Players
+	-- list had not been read yet.
+	if hostUsername == "" and entry.username ~= myUsername then
+		hostUsername = entry.username
+		hostDisplay = sync.peerDisplay
+	end
+	if first then
+		sync.connected = true
+		sync.connectedAt = now()
+		print(string.format(
+			"[Trade] CONNECTED to %s (@%s) over the link - the host's script is running in this server",
+			sync.peerDisplay,
+			sync.peerUsername
+		))
+	end
+	return first
+end
+
+-- One read: only the messages that arrived after the last id we saw.
+local function pollSync(myJobAtStart)
+	if sync.polling then
+		return false
+	end
+	sync.polling = true
+	local ok, status, body = httpSend(pollUrlBase .. sync.cursor, "GET")
+	sync.polling = false
+
+	if not ok then
+		sync.trouble = sync.trouble + 1
+		sync.lastError = status
+		if now() - sync.lastNoteAt > 60 then
+			sync.lastNoteAt = now()
+			if status == 429 then
+				print("[Trade] the relay asked us to slow down - the trade keeps its own clock, nothing is blocked")
+			else
+				print("[Trade] relay read failed (" .. tostring(status) .. ") - the trade keeps its own clock")
+			end
+		end
+		return false
+	end
+
+	sync.trouble = 0
+	sync.lastError = nil
+	sync.answered = true
+
+	for line in tostring(body):gmatch("[^\r\n]+") do
+		if jsonString(line, "event") == "message" then
+			local id = jsonString(line, "id")
+			if id ~= nil then
+				sync.cursor = id
+			end
+			local payload = jsonString(line, "message")
+			if payload ~= nil then
+				local entry = decodeMessage(payload)
+				if entry ~= nil and entry.from ~= clientId and entry.username:lower() ~= myUsername:lower() then
+					-- ServerChat's rule: only somebody really standing in this server.
+					local here = nil
+					pcall(function()
+						here = Players:FindFirstChild(entry.username)
+					end)
+					if here ~= nil then
+						if entry.event == "hello" then
+							notePeer(entry)
+							local at = now()
+							if at - sync.peerAckedAt >= 20 then
+								sync.peerAckedAt = at
+								publishMessage("ack", 0, "ack", "")
+							end
+						elseif entry.event == "ack" then
+							notePeer(entry)
+						elseif entry.event == "done" then
+							finished = true
+						elseif entry.event ~= "" then
+							local current = sync.events[entry.event]
+							if current == nil or entry.cycle > current.cycle
+								or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
+								sync.events[entry.event] = entry
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return true
+end
+
+-- One loop does both jobs: say hello now and then, and read the channel. The
+-- pause grows while the relay is refusing, so a busy relay is waited out
+-- quietly instead of being hammered.
+local function startRelayLoop()
+	if sync.started then
+		return
+	end
+	sync.started = true
+	sync.startedAt = now()
+	local jobAtStart = myJob
+	spawnFn(function()
+		while not finished do
+			local at = now()
+			local gap = CONFIG.LINK_HELLO_SECONDS
+			if sync.connected then
+				gap = CONFIG.LINK_KEEPALIVE_SECONDS
+			elseif sync.lastHelloFailed then
+				-- A hello that was refused is retried quickly: it is the one
+				-- message the handshake needs.
+				gap = CONFIG.LINK_HELLO_RETRY_SECONDS
+			end
+			if at - sync.lastHelloAt >= gap then
+				sync.lastHelloAt = at
+				sync.lastHelloFailed = not publishMessage("hello", 0, "hello", "joiner")
+			end
+			pollSync(jobAtStart)
+			-- For the first seconds the channel is read every 2s, so two copies
+			-- started together connect almost at once. After that the normal pace
+			-- applies: the relay allows 60 requests as a burst and then only about
+			-- one every 10 seconds.
+			local pause = CONFIG.LINK_POLL_SECONDS
+			if now() - sync.startedAt < CONFIG.LINK_START_POLL_WINDOW then
+				pause = CONFIG.LINK_START_POLL_SECONDS
+			end
+			if sync.trouble > 0 then
+				pause = math.min(CONFIG.LINK_MAX_POLL_SECONDS, pause * (1 + sync.trouble))
+			end
+			waitFn(pause)
+		end
+	end)
 end
 
 --------------------------------------------------------------------------
@@ -590,40 +643,274 @@ local function tradeGui()
 	return playerGui:FindFirstChild("TradeGUI")
 end
 
-local function hideTradeGui()
-	local gui = tradeGui()
-	if gui ~= nil and gui.Enabled then
-		pcall(function()
-			gui.Enabled = false
-		end)
-	end
-end
+-- Neither script hides, disables or destroys the trade window any more: it
+-- stays on screen and usable the whole time, on both clients.
+-- The game itself sometimes switches this player's trade window off (Enabled
+-- goes false) when the request is accepted. A switched-off window cannot be
+-- accepted or confirmed - the button signals go nowhere, which is exactly the
+-- "the host accepted but the joiner never did" symptom. Nothing here ever
+-- switches it off: this only ever turns it back on.
+local windowRestores = 0
 
-local function fireButton(button)
-	if button == nil then
+local function ensureTradeWindowShown()
+	local gui = tradeGui()
+	if gui == nil then
 		return false
 	end
-	if type(firesignal) == "function" then
-		pcall(firesignal, button.Activated)
-		pcall(firesignal, button.MouseButton1Click)
-	else
-		pcall(function()
-			button.Activated:Fire()
+	local ok, enabled = pcall(function()
+		return gui.Enabled
+	end)
+	if ok and enabled ~= true then
+		local fixed = pcall(function()
+			gui.Enabled = true
 		end)
+		if fixed then
+			windowRestores = windowRestores + 1
+			print("[Trade] the trade window had been switched off (Enabled = false) - switched it back on")
+		end
 	end
 	return true
+end
+
+-- Keeps the trade window switched on for the whole session, in a loop. It runs
+-- the entire time, not only while a trade is open, because whatever switches
+-- the window off can do it at any moment. Every pass sets Enabled = true;
+-- nothing here ever sets it to false, hides anything or deletes anything.
+local SHOW_LOOP_SECONDS = 0.1
+
+local function startTradeWindowKeepAlive()
+	spawnFn(function()
+		while not finished do
+			local gui = tradeGui()
+			if gui ~= nil then
+				local wasOff = false
+				pcall(function()
+					wasOff = gui.Enabled ~= true
+					gui.Enabled = true
+				end)
+				if wasOff then
+					windowRestores = windowRestores + 1
+					print("[Trade] the trade window was off - switched it back on (" .. tostring(windowRestores) .. ")")
+				end
+			end
+			waitFn(SHOW_LOOP_SECONDS)
+		end
+	end)
+end
+
+startTradeWindowKeepAlive()
+
+-- Both signals are fired once each, exactly like the trade script that already
+-- presses accept successfully on the host's client. Neither is fired twice.
+local PRESS_SIGNALS = { "Activated", "MouseButton1Click" }
+local PRESS_CHECK_DELAY = 0.8
+
+-- Firing the signal is not the same as the game accepting: a press that lands
+-- before the host's items are in is ignored, which left this client having
+-- agreed to the request but never to the items. So the press is checked and
+-- repeated until the window shows it took.
+local ACCEPT_PRESS_ATTEMPTS = 3
+local ACCEPT_PRESS_RETRY = 1.2
+
+local function describeButton(button)
+	if button == nil then
+		return "not found"
+	end
+	local text = "?"
+	local colour = "?"
+	local visible = "?"
+	local active = "?"
+	pcall(function() text = tostring(button.Text) end)
+	pcall(function()
+		local c = button.BackgroundColor3
+		colour = string.format(
+			"%d,%d,%d",
+			math.floor(c.R * 255 + 0.5),
+			math.floor(c.G * 255 + 0.5),
+			math.floor(c.B * 255 + 0.5)
+		)
+	end)
+	pcall(function() visible = tostring(button.Visible) end)
+	pcall(function() active = tostring(button.Active) end)
+	return string.format("text=%s colour=%s visible=%s active=%s", text, colour, visible, active)
+end
+
+-- A real mouse click, for executors that expose mouse movement. It is only
+-- used when no button signal could be fired at all.
+local function realClick(button)
+	local ok, positionX, positionY = pcall(function()
+		local absolute = button.AbsolutePosition
+		local size = button.AbsoluteSize
+		return absolute.X + size.X / 2, absolute.Y + size.Y / 2
+	end)
+	if not ok then
+		return false
+	end
+	local containers = { _G }
+	if type(getgenv) == "function" then
+		local envOk, env = pcall(getgenv)
+		if envOk and type(env) == "table" then
+			containers[#containers + 1] = env
+		end
+	end
+	local move = nil
+	local click = nil
+	for _, container in ipairs(containers) do
+		move = move or safeField(container, "mousemoveabs")
+		click = click or safeField(container, "mouse1click")
+	end
+	if type(move) ~= "function" or type(click) ~= "function" then
+		return false
+	end
+	pcall(move, positionX, positionY)
+	waitFn(0.05)
+	pcall(click)
+	return true
+end
+
+local function pressButton(button, label)
+	if button == nil then
+		print("[Trade] " .. label .. ": the button does not exist on this client")
+		return false, "no button"
+	end
+
+	local before = describeButton(button)
+	local used = {}
+
+	-- One signal at a time: fire Activated, look at what the game did with it,
+	-- and only fall back to MouseButton1Click when nothing happened at all.
+	-- That is what makes "pressed twice" impossible.
+	for _, name in ipairs(PRESS_SIGNALS) do
+		local signal = nil
+		pcall(function() signal = button[name] end)
+		if signal ~= nil then
+			local ok = false
+			if type(firesignal) == "function" then
+				ok = pcall(firesignal, signal)
+			else
+				ok = pcall(function() signal:Fire() end)
+			end
+			if ok then
+				used[#used + 1] = name
+				print(string.format("[Trade] %s: pressed %s, button was %s", label, name, before))
+				waitFn(PRESS_CHECK_DELAY)
+				local after = describeButton(button)
+				if after ~= before then
+					print(string.format("[Trade] %s: the game reacted - the button is now %s", label, after))
+					return true, name
+				end
+				if tradeGui() == nil then
+					print("[Trade] " .. label .. ": the trade window closed right after the press")
+					return true, name
+				end
+				ensureTradeWindowShown()
+				print("[Trade] " .. label .. ": nothing changed after " .. name .. ", trying the other signal")
+			end
+		end
+	end
+
+	if #used == 0 then
+		if realClick(button) then
+			print("[Trade] " .. label .. ": no button signal could be fired, clicked it with the mouse instead")
+			return true, "mouse"
+		end
+		print("[Trade] " .. label .. ": no button signal could be fired and no mouse click is available")
+		return false, "no signal"
+	end
+
+	print("[Trade] " .. label .. ": pressed " .. table.concat(used, " + ") .. ", the button never changed")
+	return true, table.concat(used, "+")
 end
 
 -- How long the request may take to turn into an open trade window.
 local function waitForTradeWindow(seconds)
 	local deadline = now() + seconds
 	while not finished and now() < deadline do
+		-- If the window arrives switched off, switch it on right away: a
+		-- hidden window can never be accepted.
+		ensureTradeWindowShown()
 		if tradeGui() ~= nil then
 			return true
 		end
 		waitFn(0.2)
 	end
 	return tradeGui() ~= nil
+end-- How much is inside the trade window right now. The host's client has no way
+-- to message this client, but the server copies every item the host offers into
+-- this window, so counting elements is a local, instant answer to "have the
+-- items landed yet?" that does not depend on the relay at all.
+local function tradeWindowSize()
+	local gui = tradeGui()
+	if gui == nil then
+		return nil
+	end
+	local ok, count = pcall(function()
+		local total = 0
+		local stack = { gui }
+		while #stack > 0 do
+			local node = table.remove(stack)
+			for _, child in ipairs(node:GetChildren()) do
+				total = total + 1
+				stack[#stack + 1] = child
+			end
+		end
+		return total
+	end)
+	if ok and type(count) == "number" then
+		return count
+	end
+	return nil
+end
+
+-- Waits until the host has finished adding its items and returns the moment the
+-- last one landed. The window growing and then holding still is the signal; the
+-- relay message is only a backup, so this keeps working when it is throttled.
+local ITEM_STABLE_SECONDS = 1.2
+local ITEM_EARLIEST_SECONDS = 3.5
+
+local function waitForHostItems(cycleNumber)
+	local startedAt = now()
+	local lastSize = tradeWindowSize()
+	if lastSize == nil then
+		lastSize = 0
+	end
+	local lastGrewAt = startedAt
+	local grew = false
+
+	while not finished do
+		local elapsed = now() - startedAt
+
+		local entry = sync.events["items"]
+		if entry ~= nil and entry.cycle >= cycleNumber then
+			return "relay", now()
+		end
+
+		local size = tradeWindowSize()
+		if size == nil then
+			return "window closed", now()
+		end
+		if size > lastSize then
+			grew = true
+			lastSize = size
+			lastGrewAt = now()
+		elseif grew
+			and now() - lastGrewAt >= ITEM_STABLE_SECONDS
+			and elapsed >= ITEM_EARLIEST_SECONDS
+		then
+			return "window", lastGrewAt
+		end
+
+		if elapsed >= ITEMS_WAIT then
+			-- Nothing visible arrived, so fall back to the host's schedule: it
+			-- starts adding 2s after this window opened.
+			if grew then
+				return "window", lastGrewAt
+			end
+			return "timer", startedAt + 2
+		end
+		waitFn(0.2)
+	end
+	return "stopped", now()
 end
 
 local function fireAcceptRequest()
@@ -635,40 +922,86 @@ local function fireAcceptRequest()
 		return container:WaitForChild("AcceptRequest", 10)
 	end)
 	if not ok or remote == nil then
-		print("[Server Share] could not find Trade.AcceptRequest")
+		print("[Trade] could not find Trade.AcceptRequest")
 		return false
 	end
 	pcall(function()
 		remote:FireServer()
 	end)
-	print("[Server Share] accepted the trade request")
+	print("[Trade] accepted the trade request")
 	return true
 end
 
-local function pressAccept()
+
+-- What both trade buttons look like right now, so "the press landed" can be
+-- told apart from "the signal fired and the game ignored it".
+local function windowSnapshot()
 	local gui = tradeGui()
 	if gui == nil then
-		print("[Server Share] the trade window is not open, so accept could not be pressed")
-		return false
+		return nil
 	end
-	hideTradeGui()
-	local button = nil
-	pcall(function()
-		button = gui.Container.Trade.Actions.Accept.ActionButton
+	local parts = {}
+	local function add(label, getter)
+		pcall(function()
+			parts[#parts + 1] = label .. "[" .. describeButton(getter()) .. "]"
+		end)
+	end
+	add("accept", function()
+		return gui.Container.Trade.Actions.Accept.ActionButton
 	end)
-	if button == nil then
-		print("[Server Share] the accept button could not be found")
-		return false
+	add("confirm", function()
+		return gui.Container.Trade.Actions.Accept.Confirm.ActionButton
+	end)
+	return table.concat(parts, " ")
+end
+
+-- Presses accept and keeps pressing until the game shows it took it.
+local function acceptTheTrade()
+	local before = windowSnapshot()
+	local lastReason = "the trade window is not open"
+	for attempt = 1, ACCEPT_PRESS_ATTEMPTS do
+		ensureTradeWindowShown()
+		local gui = tradeGui()
+		if gui == nil then
+			return false, lastReason
+		end
+		local button = nil
+		pcall(function()
+			button = gui.Container.Trade.Actions.Accept.ActionButton
+		end)
+		if button ~= nil then
+			pressButton(button, "accept")
+			waitFn(PRESS_CHECK_DELAY)
+			if tradeGui() == nil then
+				print("[Trade] the trade window closed after the accept press")
+				return true, "window closed"
+			end
+			local after = windowSnapshot()
+			if after ~= nil and after ~= before then
+				print("[Trade] the game took the accept (" .. tostring(after) .. ")")
+				return true, after
+			end
+			lastReason = "the game never showed the accept"
+			print(string.format(
+				"[Trade] accept attempt %d did not register - pressing again",
+				attempt
+			))
+		else
+			lastReason = "the accept button could not be found"
+			print("[Trade] accept attempt " .. tostring(attempt) .. ": the accept button is not in the window yet")
+		end
+		if attempt < ACCEPT_PRESS_ATTEMPTS then
+			waitFn(ACCEPT_PRESS_RETRY)
+		end
 	end
-	fireButton(button)
-	print("[Server Share] fired the accept button")
-	return true
+	return false, lastReason
 end
 
 local function pressConfirm()
+	ensureTradeWindowShown()
 	local gui = tradeGui()
 	if gui == nil then
-		print("[Server Share] the trade window is not open, so confirm could not be pressed")
+		print("[Trade] the trade window is not open, so confirm could not be pressed")
 		return false
 	end
 	local button = nil
@@ -676,684 +1009,241 @@ local function pressConfirm()
 		button = gui.Container.Trade.Actions.Accept.Confirm.ActionButton
 	end)
 	if button == nil then
-		print("[Server Share] the confirm button could not be found")
-		return false
+		print("[Trade] the confirm button could not be found at Container.Trade.Actions.Accept.Confirm.ActionButton")
+		return false, "no button"
 	end
-	fireButton(button)
-	print("[Server Share] fired the confirm button")
-	return true
+	return pressButton(button, "confirm")
 end
 
--- The request shows up as a popup; watching for it makes the 2 second delay
--- start from when it really arrived rather than from the next relay poll.
-local popup = { seen = 0, handled = 0 }
+-- The request is visible in this client's own UI, which is what makes cycle 2,
+-- 3, 4... work: the popup (or the trade window itself) is the signal, and the
+-- relay is only a second opinion. The element used to live at
+-- MainGUI.Game.Leaderboard.Container.TradeRequest, but that path belongs to the
+-- game, so the whole PlayerGui is searched for the element by name.
 
-local function requestPopupVisible()
+local deepSearchAt = 0
+
+local function requestIndicatorVisible()
 	if playerGui == nil then
 		playerGui = me:FindFirstChild("PlayerGui")
 	end
 	if playerGui == nil then
 		return false
 	end
-	local ok, visible = pcall(function()
+
+	-- The cheap check first: the path the game has always used for the popup.
+	local ok, found = pcall(function()
 		local mainGUI = playerGui:FindFirstChild("MainGUI")
-		if mainGUI == nil then
-			return false
-		end
-		local board = mainGUI.Game.Leaderboard.Container
-		return board:FindFirstChild("TradeRequest") ~= nil
+		local gameNode = mainGUI and mainGUI:FindFirstChild("Game")
+		local board = gameNode and gameNode:FindFirstChild("Leaderboard")
+		local container = board and board:FindFirstChild("Container")
+		return container ~= nil and container:FindFirstChild("TradeRequest") ~= nil
 	end)
-	return ok and visible == true
-end
-
-spawnFn(function()
-	local wasVisible = false
-	while not finished do
-		local visible = requestPopupVisible()
-		if visible and not wasVisible then
-			popup.seen = popup.seen + 1
-		end
-		wasVisible = visible
-		waitFn(0.2)
-	end
-end)
-
-local function waitForRequest(cycle)
-	local startedAt = now()
-	while not finished do
-		if popup.seen > popup.handled then
-			popup.handled = popup.seen
-			return "popup"
-		end
-		local entry = sync.events["req"]
-		if entry ~= nil and entry.cycle >= cycle then
-			return "relay"
-		end
-		if now() - startedAt >= REQUEST_TIMEOUT then
-			return nil
-		end
-		waitFn(0.25)
-	end
-	return nil
-end
-
---------------------------------------------------------------------------
--- Hunting for the next host once this one is finished
---------------------------------------------------------------------------
-
-local finishedJobs = { [myJob] = true }
-local queueOnTeleport = nil
-
-do
-	local containers = { _G }
-	if type(getgenv) == "function" then
-		local ok, env = pcall(getgenv)
-		if ok and type(env) == "table" and env ~= _G then
-			containers[#containers + 1] = env
-		end
-	end
-	for _, name in ipairs({ "syn", "fluxus", "krnl", "http" }) do
-		local container = rawget(_G, name)
-		if container ~= nil and container ~= _G then
-			containers[#containers + 1] = container
-		end
-	end
-	for _, name in ipairs({ "queue_on_teleport", "queueonteleport", "queue_teleport" }) do
-		for _, container in ipairs(containers) do
-			local fn = safeField(container, name)
-			if type(fn) == "function" and queueOnTeleport == nil then
-				queueOnTeleport = fn
-			end
-		end
-	end
-end
-
-local function decodeServer(text)
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 7 or parts[1] ~= "v2" then
-		return nil
-	end
-	local place = tonumber(parts[2])
-	local job = parts[3]
-	local stamp = tonumber(parts[7])
-	if not place or place <= 0 then
-		return nil
-	end
-	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
-		return nil
-	end
-	if not stamp then
-		return nil
-	end
-	return {
-		place = place,
-		job = job,
-		username = cleanText(parts[4], 40),
-		display = cleanText(parts[5], 40),
-		game = cleanText(parts[6], 60),
-		stamp = stamp,
-	}
-end
-
--- h1|placeId|jobId|username|displayName|gameName|timestamp
--- A live host answers the ping below with one of these, so only a server that
--- is really running right now can be followed.
-local function decodeAck(text)
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 7 or parts[1] ~= "h1" then
-		return nil
-	end
-	local place = tonumber(parts[2])
-	local job = parts[3]
-	local stamp = tonumber(parts[7])
-	if not place or place <= 0 then
-		return nil
-	end
-	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
-		return nil
-	end
-	if not stamp then
-		return nil
-	end
-	return {
-		place = place,
-		job = job,
-		username = cleanText(parts[4], 40),
-		display = cleanText(parts[5], 40),
-		game = cleanText(parts[6], 60),
-		stamp = stamp,
-	}
-end
-
--- Puts "is anybody hosting?" on the joiner topic and returns the hosts that
--- answered it. Anybody can leave an announcement behind; only a host that is
--- running can answer a ping.
-local function askForHosts()
-	local pingStamp = os.time()
-	pcall(function()
-		httpSend(relayBase .. "/" .. presenceTopic, "POST", table.concat({
-			"q1",
-			tostring(myPlace),
-			myUsername,
-			tostring(pingStamp),
-		}, "|"))
-	end)
-
-	waitFn(5)
-
-	local ok, status, body = httpSend(relayBase .. "/" .. presenceTopic .. "/raw?poll=1&since=3m", "GET")
-	if not ok then
-		return nil, "the relay could not be read (error " .. tostring(status) .. ")"
+	if ok and found then
+		return true
 	end
 
-	local acks = {}
-	for line in tostring(body):gmatch("[^\r\n]+") do
-		local entry = decodeAck(line)
-		if entry ~= nil
-			and entry.username:lower() ~= myUsername:lower()
-			and entry.stamp >= pingStamp - 15
-			then
-			acks[#acks + 1] = entry
-		end
-	end
-	return acks
-end
-
-local function findNextHost()
-	local acks, err = askForHosts()
-	if acks == nil then
-		return nil, err
-	end
-	local best = nil
-	for _, entry in ipairs(acks) do
-		if not finishedJobs[entry.job] and entry.job ~= myJob then
-			if best == nil or entry.stamp >= best.stamp then
-				best = entry
-			end
-		end
-	end
-	if best == nil then
-		return nil, "no other host is answering right now"
-	end
-	return best
-end
-
--- The host name baked into this copy belongs to the server it was queued
--- for. A copy that followed a different host has to find out who runs this
--- job before it can talk to them.
-local function findHostInThisJob()
-	local ok, status, body = httpSend(relayBase .. "/" .. serverTopic .. "/raw?poll=1&since=30m", "GET")
-	if not ok then
-		return nil, status
-	end
-	local found = nil
-	for line in tostring(body):gmatch("[^\r\n]+") do
-		local entry = decodeServer(line)
-		if entry ~= nil and entry.job == myJob then
-			if found == nil or entry.stamp >= found.stamp then
-				found = entry
-			end
-		end
-	end
-	if found ~= nil then
-		return found
-	end
-
-	-- Nothing announced for this job: ask the live hosts straight out.
-	local acks = askForHosts()
-	if acks ~= nil then
-		for _, entry in ipairs(acks) do
-			if entry.job == myJob then
-				return entry
-			end
-		end
-	end
-	return nil
-end
-
-if myJob ~= bakedJob then
-	local entry = findHostInThisJob()
-	if entry ~= nil then
-		hostUsername = entry.username
-		hostDisplay = entry.display ~= "" and entry.display or entry.username
-	end
-	print("[Server Share] host of this server is " .. hostDisplay .. " (" .. hostUsername .. ")")
-end
-
-local function followNextHost()
-	local nextHost, reason = findNextHost()
-	if nextHost == nil then
-		return false, reason
-	end
-	if nextGeneration == "" then
-		return false, "this copy has no next-generation script"
-	end
-	if queueOnTeleport == nil then
-		return false, "this executor has no queue_on_teleport"
-	end
-
-	print(string.format(
-		"[Server Share] following %s into place %d, job %s",
-		nextHost.display ~= "" and nextHost.display or nextHost.username,
-		nextHost.place,
-		nextHost.job
-	))
-
-	-- Tell that host who is coming, then arm the next server before leaving.
-	local payload = table.concat({
-		"j1",
-		tostring(nextHost.place),
-		tostring(nextHost.job),
-		myUsername,
-		myDisplay,
-		tostring(os.time()),
-	}, "|")
-	pcall(function()
-		httpSend(relayBase .. "/" .. presenceTopic, "POST", payload)
-	end)
-
-	local queued = pcall(queueOnTeleport, nextGeneration)
-	if not queued then
-		return false, "the next server could not be armed"
-	end
-
-	local ok, err = pcall(function()
-		TeleportService:TeleportToPlaceInstance(nextHost.place, nextHost.job, me)
-	end)
-	if not ok then
-		return false, "the teleport failed: " .. tostring(err)
-	end
-	return true
-end
-
---------------------------------------------------------------------------
--- Trade driver
---------------------------------------------------------------------------
-
--- Tell the host this side is live. It is only for the card and the console;
--- the host starts its own 5 second timer from the Players list.
-publish("ready", 0, myDisplay)
-
-local cycle = 0
-while not finished do
-	cycle = cycle + 1
-
-	local trigger = waitForRequest(cycle)
-	if trigger == nil then
-		if not finished then
-			print("[Server Share] no trade request arrived for cycle " .. tostring(cycle))
-		end
-		break
-	end
-
-	print(string.format("[Server Share] cycle %d: request seen (%s), accepting it in %ss", cycle, trigger, tostring(REQUEST_DELAY)))
-	waitFn(REQUEST_DELAY)
-	fireAcceptRequest()
-
-	-- The host waits for this before it adds anything: it is the proof that the
-	-- trade window really opened, so its items land in a live trade instead of
-	-- going into a request that never got through.
-	local windowOpen = waitForTradeWindow(WINDOW_WAIT)
-	if windowOpen then
-		print("[Server Share] cycle " .. tostring(cycle) .. ": the trade window is open - told the host")
-	else
-		print("[Server Share] cycle " .. tostring(cycle) .. ": the trade window did not open in time")
-	end
-	publish("reqok", cycle, windowOpen and "open" or "nowindow")
-
-	-- The host adds its items five seconds after the request; it then posts
-	-- "items". If that never arrives, fall back to a plain timer.
-	local deadline = now() + ITEMS_FALLBACK
-	local sawItems = false
-	while not finished do
-		local entry = sync.events["items"]
-		if entry ~= nil and entry.cycle >= cycle then
-			sawItems = true
-			break
-		end
-		if now() >= deadline then
-			break
-		end
-		waitFn(0.25)
-	end
-	if finished then
-		break
-	end
-	if sawItems then
-		print(string.format("[Server Share] cycle %d: host says its items are in", cycle))
-	else
-		print(string.format("[Server Share] cycle %d: no word from the host, using the timer", cycle))
-	end
-
-	print("[Server Share] cycle " .. tostring(cycle) .. ": accepting in " .. tostring(ACCEPT_DELAY) .. "s")
-	waitFn(ACCEPT_DELAY)
-
-	local accepted = pressAccept()
-	publish("accept", cycle, accepted and "ok" or "missing")
-
-	if waitFor("accept", cycle, ACK_WAIT) then
-		print("[Server Share] the host accepted too - confirming")
-	else
-		print("[Server Share] no accept from the host yet - confirming anyway")
-	end
-
-	waitFn(CONFIRM_DELAY)
-	local confirmed = pressConfirm()
-	publish("confirm", cycle, confirmed and "ok" or "missing")
-	waitFor("confirm", cycle, ACK_WAIT)
-
-	print(string.format("=== cycle %d finished ===", cycle))
-end
-
---------------------------------------------------------------------------
--- Either the host is done or it went quiet: look for the next host
---------------------------------------------------------------------------
-
-if finished then
-	print("[Server Share] the host finished - looking for the next host")
-else
-	print("[Server Share] stopping here - looking for the next host")
-end
-
-local moved, reason = followNextHost()
-if not moved then
-	print("[Server Share] " .. tostring(reason) .. ". Run joiner.lua again to keep going.")
-end
-]====]
-
--- The file's own currentJobId() is declared further down, so this copy reads
--- the job straight from the client instead of relying on hoisting.
-local function jobIdNow()
-	local ok, job = pcall(function()
-		return game.JobId
-	end)
-	if ok and type(job) == "string" then
-		return job
-	end
-	return ""
-end
-
--- Builds the session script. `withNextGeneration` embeds one more copy of the
--- same script as hex, so the copy that runs in the next server can arm another
--- one after that. Hex means an odd username or URL can never break out of the
--- string, and the copy is only ever produced by this function.
-local function buildSessionSource(withNextGeneration)
-	local base = SESSION_TEMPLATE
-
-	local function fill(source)
-		source = source:gsub("__RELAY_HEX__", function()
-			return toHex(relayBase)
-		end)
-		source = source:gsub("__SYNC_TOPIC_HEX__", function()
-			return toHex(syncTopic)
-		end)
-		source = source:gsub("__SERVER_TOPIC_HEX__", function()
-			return toHex(topic)
-		end)
-		source = source:gsub("__HOST_USER_HEX__", function()
-			return toHex(hostUsername)
-		end)
-		source = source:gsub("__HOST_DISPLAY_HEX__", function()
-			return toHex(hostDisplay)
-		end)
-		source = source:gsub("__JOB_HEX__", function()
-			return toHex(jobIdNow())
-		end)
-		source = source:gsub("__REQUEST_DELAY__", function()
-			return tostring(CONFIG.REQUEST_ACCEPT_DELAY)
-		end)
-		source = source:gsub("__ITEMS_FALLBACK__", function()
-			return tostring(CONFIG.ITEMS_FALLBACK_SECONDS)
-		end)
-		source = source:gsub("__ACCEPT_DELAY__", function()
-			return tostring(CONFIG.ACCEPT_DELAY_SECONDS)
-		end)
-		source = source:gsub("__CONFIRM_DELAY__", function()
-			return tostring(CONFIG.CONFIRM_DELAY_SECONDS)
-		end)
-		source = source:gsub("__ACK_WAIT__", function()
-			return tostring(CONFIG.ACK_WAIT_SECONDS)
-		end)
-		source = source:gsub("__SYNC_POLL__", function()
-			return tostring(CONFIG.SYNC_POLL_SECONDS)
-		end)
-		source = source:gsub("__REQUEST_TIMEOUT__", function()
-			return tostring(CONFIG.REQUEST_TIMEOUT_SECONDS)
-		end)
-		source = source:gsub("__WINDOW_WAIT__", function()
-			return tostring(CONFIG.WINDOW_WAIT_SECONDS)
-		end)
-		return source
-	end
-
-	local nextSource = ""
-	if withNextGeneration then
-		nextSource = toHex(fill(base))
-	end
-
-	local source = fill(base)
-	source = source:gsub("__SPARE_HEX__", function()
-		return nextSource
-	end)
-	return source
-end
-
--- The copy queued now; the spare is what gets queued again from inside it.
-local function buildSession()
-	return buildSessionSource(true)
-end
-
-local function queueSession()
-	if not queueOnTeleport then
+	-- Then a bounded search of the whole PlayerGui, once a second: the popup
+	-- moving somewhere else in the game's UI still gets found, without walking
+	-- the whole tree five times a second.
+	if now() - deepSearchAt < 1 then
 		return false
 	end
-	return pcall(queueOnTeleport, buildSession())
+	deepSearchAt = now()
+
+	local deep, deepFound = pcall(function()
+		local stack = { playerGui }
+		local seen = 0
+		while #stack > 0 and seen < 600 do
+			local node = table.remove(stack)
+			seen = seen + 1
+			for _, child in ipairs(node:GetChildren()) do
+				if child.Name == "TradeRequest" then
+					return true
+				end
+				stack[#stack + 1] = child
+			end
+		end
+		return false
+	end)
+	return deep and deepFound == true
 end
 
-local function clearQueuedScript()
-	if not queueOnTeleport then
+-- A request that never turned into a trade window (it expired, or the accept
+-- did not reach the game) gets a local retry, then this cycle is handed back
+-- to the host, which sends the same request again.
+local REQUEST_RETRY_SECONDS = 3
+local REQUEST_RETRY_WAIT = 3
+
+-- Every relay request is used once, keyed by the message itself, so a request
+-- the host sends again counts as new while an old message is never replayed.
+local lastReqKey = nil
+
+-- The host is told once per request that the window never opened, so a slow
+-- relay is not spent on repeats.
+local nowindowTold = nil
+
+local function tellNowindow(cycleNumber)
+	local attempt = tostring(cycleNumber) .. ":" .. tostring(lastReqKey)
+	if nowindowTold == attempt then
 		return
 	end
-	-- An empty script replaces anything still queued, so a teleport that never
-	-- happened does not fire the session on some later, unrelated join.
-	pcall(queueOnTeleport, "")
+	nowindowTold = attempt
+	publish("reqok", cycleNumber, "nowindow")
 end
 
--- Running the session where we already are, e.g. joiner.lua started inside
--- the host's server or run again after a finished session.
-local sessionRun = { started = false }
+-- How long the host may be missing from the server before this session stops
+-- waiting for it.
+local HOST_GONE_SECONDS = 30
 
-local function findLoadstring()
-	local candidates = {
-		rawget(_G, "loadstring"),
-		rawget(_G, "load"),
-	}
-	if type(getgenv) == "function" then
-		local ok, environment = pcall(getgenv)
-		if ok and type(environment) == "table" then
-			candidates[#candidates + 1] = rawget(environment, "loadstring")
-			candidates[#candidates + 1] = rawget(environment, "load")
+local function hostInServer()
+	local ok, player = pcall(function()
+		return Players:FindFirstChild(hostUsername)
+	end)
+	return ok and player ~= nil
+end
+
+-- Waits for the next request. The order of preference is what makes cycles
+-- chain quickly: an open trade window first, then the request popup, then the
+-- host's message. The one thing that ends the wait is the host leaving.
+-- Filled in once the card exists. Declared here so the wait below can report
+-- on it; the card functions themselves are defined further down.
+local cardStatus, cardInfo
+
+-- If the host is still in the server but nothing has happened for this long,
+-- it is almost certainly finished (its own console says so). This side says it
+-- on the card and keeps listening, so a late request is still picked up.
+local IDLE_FINISH_SECONDS = 45
+
+local function waitForRequest(cycle)
+	local lastNoteAt = now()
+	local hostGoneAt = nil
+	local armedAt = 0
+	local idleNoted = false
+	while not finished do
+		if tradeGui() ~= nil then
+			return "window"
 		end
+
+		local entry = sync.events["req"]
+		local relayWanted = entry ~= nil and entry.cycle >= cycle
+		local visible = requestIndicatorVisible()
+
+		if (visible or relayWanted) and now() - armedAt > 1.5 then
+			armedAt = now()
+			if relayWanted then
+				local key = tostring(entry.cycle) .. ":" .. tostring(entry.payload) .. ":" .. tostring(entry.stamp)
+				if key ~= lastReqKey then
+					lastReqKey = key
+					return "relay"
+				end
+			end
+			if visible then
+				return "popup"
+			end
+		end
+
+		if hostInServer() then
+			hostGoneAt = nil
+		elseif hostGoneAt == nil then
+			hostGoneAt = now()
+		elseif now() - hostGoneAt >= HOST_GONE_SECONDS then
+			print("[Trade] the host is no longer in this server - this session is over")
+			finished = true
+			break
+		end
+
+		if not idleNoted and now() - armedAt >= IDLE_FINISH_SECONDS then
+			idleNoted = true
+			print("[Trade] the host has gone quiet - it has most likely finished. Still listening.")
+			if cardStatus ~= nil then
+				cardStatus("The host has gone quiet - it has most likely finished", "green")
+			end
+			if cardInfo ~= nil then
+				cardInfo("Nothing left to trade. Still listening for a request.")
+			end
+		end
+
+		if now() - lastNoteAt >= 20 then
+			print("[Trade] still waiting for the host's trade request (cycle " .. tostring(cycle) .. ")")
+			lastNoteAt = now()
+		end
+		waitFn(0.2)
 	end
-	for _, candidate in ipairs(candidates) do
-		if type(candidate) == "function" then
-			return candidate
+	return nil
+end
+
+-- Who the host is
+--------------------------------------------------------------------------
+
+--
+-- Nothing joins anybody: both people are already in this server. The host is
+-- simply the other player here, so its username - which every message and the
+-- trade itself are addressed to - is read straight from the Players list.
+
+-- Whoever else is in this server.
+local function otherPlayer()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= me then
+			return player
 		end
 	end
 	return nil
 end
 
-local function startSessionHere()
-	if sessionRun.started then
-		return false
-	end
-	local loader = findLoadstring()
-	if not loader then
-		print("[Server Joiner] this executor has no loadstring, so the session cannot be started here")
-		return false
-	end
-	local chunk, err = loader(buildSession())
-	if type(chunk) ~= "function" then
-		print("[Server Joiner] could not build the session: " .. tostring(err))
-		return false
-	end
-	sessionRun.started = true
-	print("[Server Joiner] starting the session here for " .. hostUsername)
-	spawnThread(function()
-		local ok, runErr = pcall(chunk)
-		if not ok then
-			print("[Server Joiner] the session ended: " .. tostring(runErr))
-		end
-	end)
-	return true
-end
+-- CONNECTED to whoever else is here, or waiting for them to show up.
 
---------------------------------------------------------------------------
--- Room / wire format
---------------------------------------------------------------------------
+-- Filled in once the card below exists, so the wait can report on it.
 
-local PRESENCE_VERSION = "j1" -- what this script publishes
+-- CONFIG.HOST pins a username; otherwise it is whoever else is here.
+local function findTheHost()
+	local wanted = CONFIG.HOST ~= nil and tostring(CONFIG.HOST) ~= "" and tostring(CONFIG.HOST) or nil
+	local pinned = wanted ~= nil
+	local nextNote = now() + 15
 
--- j1|placeId|jobId|username|displayName|timestamp
-local function encodePresence(place, job, username, display, timestamp)
-	return table.concat({
-		PRESENCE_VERSION,
-		tostring(place),
-		cleanText(tostring(job), 100),
-		cleanText(tostring(username), 40),
-		cleanText(tostring(display), 40),
-		tostring(timestamp),
-	}, "|")
-end
-
-local function relayPublishPresence(text)
-	if httpRequest then
-		return http(relayBase .. "/" .. presenceTopic, "POST", text, {
-			["Content-Type"] = "text/plain",
-		})
-	end
-	return http(relayBase .. "/" .. presenceTopic .. "/publish?message=" .. urlEncode(text), "GET")
-end
-
--- Tells the host "this username is coming / is here". Sent right before the
--- teleport and again by the queued script after the teleport.
-local function publishPresence(info)
-	if not info then
-		return false
-	end
-	local payload = encodePresence(info.place, info.job, myUsername, myDisplay, os.time())
-	local ok, status = relayPublishPresence(payload)
-	if ok then
-		print("[Server Share] announced " .. myUsername .. " to the host")
-	else
-		print("[Server Share] could not announce " .. myUsername .. " (error " .. tostring(status) .. ")")
-	end
-	return ok
-end
-
--- h1|placeId|jobId|username|displayName|gameName|timestamp
---
--- The answer a live host gives to "is anybody hosting?". Only these answers are
--- followed: a plain announcement can be minutes old (or come from a server
--- this very client is sitting in), so it is never trusted on its own.
-local ACK_VERSION = "h1"
-
-local function decodeAck(text)
-	if type(text) ~= "string" then
-		return nil
-	end
-	local parts = {}
-	for part in (text .. "|"):gmatch("([^|]*)|") do
-		parts[#parts + 1] = part
-	end
-	if #parts ~= 7 or parts[1] ~= ACK_VERSION then
-		return nil
+	if pinned then
+		print("[Trade] using the host set in the config: " .. wanted)
 	end
 
-	local place = tonumber(parts[2])
-	local job = parts[3]
-	local stamp = tonumber(parts[7])
-
-	if not place or place <= 0 or math.floor(place) ~= place then
-		return nil
-	end
-	if type(job) ~= "string" or #job < 6 or #job > 100 or job:find("[^%w%-_%.]") then
-		return nil
-	end
-	if not stamp then
-		return nil
-	end
-
-	local username = cleanText(parts[4], 40)
-	if username == "" or #username > 25 or username:find("[^%w_]") then
-		return nil
-	end
-
-	return {
-		place = place,
-		job = job,
-		username = username,
-		display = cleanText(parts[5], 40),
-		game = cleanText(parts[6], 60),
-		stamp = stamp,
-	}
-end
-
--- Asks the room whether a host is running right now ("q1" on the joiner
--- topic) and returns the hosts that answered, oldest first. A host that is not
--- running cannot answer, so a dead server can never be followed.
-local function findLiveHosts()
-	local pingStamp = os.time()
-	local ping = table.concat({
-		"q1",
-		tostring(tonumber(game.PlaceId) or 0),
-		myUsername,
-		tostring(pingStamp),
-	}, "|")
-
-	local published, publishStatus = relayPublishPresence(ping)
-	if not published and publishStatus == 429 then
-		return nil, 429
-	end
-
-	waitSeconds(5)
-
-	local url = relayBase .. "/" .. presenceTopic .. "/raw?poll=1&since=3m"
-	local ok, status, body = http(url, "GET")
-	if not ok then
-		return nil, status
-	end
-
-	local wanted = CONFIG.HOST ~= nil and tostring(CONFIG.HOST):lower() or nil
-	local found = {}
-
-	for line in tostring(body):gmatch("[^\r\n]+") do
-		local entry = decodeAck(line)
-		if entry ~= nil
-			and entry.username:lower() ~= myUsername:lower()
-			and entry.stamp >= pingStamp - 15
-			then
-			if wanted == nil or entry.display:lower() == wanted or entry.username:lower() == wanted then
-				found[#found + 1] = entry
+	while not finished do
+		local found = nil
+		if pinned then
+			for _, player in ipairs(Players:GetPlayers()) do
+				if player ~= me and player.Name:lower() == wanted:lower() then
+					found = player
+					break
+				end
 			end
+		else
+			found = otherPlayer()
 		end
+
+		if found ~= nil then
+			hostUsername = tostring(found.Name)
+			hostDisplay = cleanText(tostring(found.DisplayName or found.Name), 40)
+			if pinned then
+				print("[Trade] the host is here: " .. hostDisplay .. " (@" .. hostUsername .. ")")
+			else
+				print("[Trade] the other person in this server, the host, is " .. hostDisplay .. " (@" .. hostUsername .. ")")
+			end
+			return true
+		end
+
+		if now() >= nextNote then
+			print(pinned and "[Trade] waiting for " .. wanted .. " to be in this server (both scripts must be in the SAME server)..." or "[Trade] waiting for the host to be in this server (both scripts must be in the SAME server)...")
+			if cardStatus ~= nil then
+				cardStatus("NOT CONNECTED - nobody else here", "amber")
+				cardInfo("Both scripts must be in the SAME server")
+			end
+			nextNote = now() + 15
+		end
+		waitFn(1)
 	end
-
-	table.sort(found, function(a, b)
-		return a.stamp < b.stamp
-	end)
-
-	return found
+	return false
 end
 
 --------------------------------------------------------------------------
--- UI
+-- The card: what this side is connected to and doing right now
 --------------------------------------------------------------------------
 
 local THEME = {
@@ -1361,469 +1251,462 @@ local THEME = {
 	line = Color3.fromRGB(46, 50, 62),
 	text = Color3.fromRGB(233, 236, 242),
 	soft = Color3.fromRGB(146, 152, 167),
-	muted = Color3.fromRGB(108, 113, 126),
 	green = Color3.fromRGB(80, 208, 138),
 	amber = Color3.fromRGB(240, 186, 84),
 	red = Color3.fromRGB(240, 106, 106),
 }
 
-local function create(class, props, children)
-	local instance = Instance.new(class)
-	if props then
-		for key, value in pairs(props) do
+local ui = { gui = nil, status = nil, info = nil, dot = nil }
+
+local function setStatus(text, color)
+	if type(color) == "string" then
+		color = THEME[color] or THEME.amber
+	end
+	if ui.status == nil then
+		return
+	end
+	pcall(function()
+		ui.status.Text = tostring(text)
+		ui.status.TextColor3 = color
+		ui.dot.BackgroundColor3 = color
+	end)
+end
+
+local function setInfo(text)
+	if ui.info == nil then
+		return
+	end
+	pcall(function()
+		ui.info.Text = tostring(text)
+	end)
+end
+
+-- The card only ever reports. It has no buttons, so it cannot cancel a trade,
+-- and every call is wrapped: a game that refuses to create guis gets a console
+-- line instead of a broken session.
+local cardOk, cardErr = pcall(function()
+	local parent = nil
+	if type(gethui) == "function" then
+		local ok, container = pcall(gethui)
+		if ok and container ~= nil then
+			parent = container
+		end
+	end
+	if parent == nil then
+		local ok, core = pcall(function()
+			return game:GetService("CoreGui")
+		end)
+		if ok and core ~= nil then
+			parent = core
+		end
+	end
+	if parent == nil then
+		parent = me:FindFirstChild("PlayerGui")
+	end
+	if parent == nil then
+		return
+	end
+
+	local function create(class, props)
+		local instance = Instance.new(class)
+		for key, value in pairs(props or {}) do
 			if key ~= "Parent" then
 				instance[key] = value
 			end
 		end
-	end
-	if children then
-		for _, child in ipairs(children) do
-			child.Parent = instance
+		if props and props.Parent then
+			instance.Parent = props.Parent
 		end
+		return instance
 	end
-	if props and props.Parent then
-		instance.Parent = props.Parent
+
+	local old = parent:FindFirstChild("TradeJoiner")
+	if old ~= nil then
+		old:Destroy()
 	end
-	return instance
-end
-
-local function corner(parent, radius)
-	return create("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
-end
-
-local function stroke(parent, color)
-	return create("UIStroke", {
-		Color = color,
-		Thickness = 1,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-		Parent = parent,
-	})
-end
-
-local function resolveGuiParent()
-	if type(gethui) == "function" then
-		local ok, container = pcall(gethui)
-		if ok and typeof(container) == "Instance" then
-			return container
-		end
-	end
-	local ok, core = pcall(function()
-		return game:GetService("CoreGui")
-	end)
-	if ok and core then
-		return core
-	end
-	return localPlayer:WaitForChild("PlayerGui")
-end
-
-local function destroyPrevious()
-	pcall(function()
-		local core = game:GetService("CoreGui")
-		for _, name in ipairs({ "ServerShareHost", "ServerShareJoiner" }) do
-			local old = core:FindFirstChild(name)
-			if old then
-				old:Destroy()
-			end
-		end
-	end)
-	pcall(function()
-		local gui = localPlayer:FindFirstChild("PlayerGui")
-		if gui then
-			for _, name in ipairs({ "ServerShareHost", "ServerShareJoiner" }) do
-				local old = gui:FindFirstChild(name)
-				if old then
-					old:Destroy()
-				end
-			end
-		end
-	end)
-end
-
-local function buildUI()
-	destroyPrevious()
 
 	local gui = create("ScreenGui", {
-		Name = "ServerShareJoiner",
+		Name = "TradeJoiner",
 		ResetOnSpawn = false,
 		IgnoreGuiInset = true,
 		DisplayOrder = 50,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		Parent = resolveGuiParent(),
+		Parent = parent,
 	})
 
 	local card = create("Frame", {
 		Name = "Card",
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -16, 0, 16),
-		Size = UDim2.fromOffset(300, 200),
+		Position = UDim2.fromOffset(16, 16),
+		Size = UDim2.fromOffset(272, 62),
 		BackgroundColor3 = THEME.panel,
 		BorderSizePixel = 0,
 		Parent = gui,
 	})
-	corner(card, 12)
-	stroke(card, THEME.line)
-
-	local header = create("TextButton", {
-		Name = "Header",
-		Size = UDim2.new(1, 0, 0, 32),
-		BackgroundTransparency = 1,
-		AutoButtonColor = false,
-		Text = "",
+	create("UICorner", { CornerRadius = UDim.new(0, 10), Parent = card })
+	create("UIStroke", {
+		Color = THEME.line,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 		Parent = card,
 	})
+
 	create("TextLabel", {
-		Size = UDim2.new(1, -24, 1, 0),
-		Position = UDim2.fromOffset(14, 0),
+		Name = "Title",
+		Position = UDim2.fromOffset(12, 8),
+		Size = UDim2.new(1, -32, 0, 14),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamBold,
-		TextSize = 13,
+		TextSize = 12,
 		TextColor3 = THEME.text,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "SERVER JOINER",
-		Parent = header,
+		Text = "TRADE JOINER",
+		Parent = card,
 	})
 
-	local dot = create("Frame", {
+	ui.dot = create("Frame", {
 		Name = "Dot",
-		Position = UDim2.new(1, -20, 0, 12),
+		Position = UDim2.new(1, -20, 0, 11),
 		Size = UDim2.fromOffset(8, 8),
 		BackgroundColor3 = THEME.amber,
 		BorderSizePixel = 0,
 		Parent = card,
 	})
-	corner(dot, 99)
+	create("UICorner", { CornerRadius = UDim.new(1, 0), Parent = ui.dot })
 
-	local infoLabel = create("TextLabel", {
-		Name = "Info",
-		Position = UDim2.fromOffset(14, 34),
-		Size = UDim2.new(1, -28, 0, 68),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Code,
-		TextSize = 11,
-		TextColor3 = THEME.soft,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		TextWrapped = true,
-		Text = "No server info yet.",
-		Parent = card,
-	})
-
-	local statusLabel = create("TextLabel", {
+	ui.status = create("TextLabel", {
 		Name = "Status",
-		Position = UDim2.fromOffset(14, 102),
-		Size = UDim2.new(1, -28, 0, 46),
+		Position = UDim2.fromOffset(12, 26),
+		Size = UDim2.new(1, -24, 0, 16),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamMedium,
 		TextSize = 11,
 		TextColor3 = THEME.amber,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		TextWrapped = true,
-		Text = "Looking for the host...",
+		Text = "Connecting...",
 		Parent = card,
 	})
 
-	local joinButton = create("TextButton", {
-		Name = "Join",
-		AnchorPoint = Vector2.new(0, 1),
-		Position = UDim2.new(0, 14, 1, -12),
-		Size = UDim2.fromOffset(96, 24),
-		BackgroundColor3 = THEME.panel,
-		AutoButtonColor = false,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 11,
+	ui.info = create("TextLabel", {
+		Name = "Info",
+		Position = UDim2.fromOffset(12, 42),
+		Size = UDim2.new(1, -24, 0, 14),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Code,
+		TextSize = 10,
 		TextColor3 = THEME.soft,
-		Text = "Join now",
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
 		Parent = card,
 	})
-	corner(joinButton, 6)
-	stroke(joinButton, THEME.line)
 
-	local stopButton = create("TextButton", {
-		Name = "Stop",
-		AnchorPoint = Vector2.new(1, 1),
-		Position = UDim2.new(1, -14, 1, -12),
-		Size = UDim2.fromOffset(72, 24),
-		BackgroundColor3 = THEME.panel,
-		AutoButtonColor = false,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 11,
-		TextColor3 = THEME.soft,
-		Text = "Stop",
-		Parent = card,
-	})
-	corner(stopButton, 6)
-	stroke(stopButton, THEME.line)
-
-	local dragging = false
-	local dragStart, startPosition
-	header.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = input.Position
-			startPosition = card.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-				end
-			end)
-		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
-		if not dragging then
-			return
-		end
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			local delta = input.Position - dragStart
-			card.Position = UDim2.new(
-				startPosition.X.Scale,
-				startPosition.X.Offset + delta.X,
-				startPosition.Y.Scale,
-				startPosition.Y.Offset + delta.Y
-			)
-		end
-	end)
-
-	return {
-		gui = gui,
-		card = card,
-		dot = dot,
-		status = statusLabel,
-		info = infoLabel,
-		join = joinButton,
-		stop = stopButton,
-	}
-end
-
-local ui = buildUI()
-
-local state = {
-	running = true,
-	info = nil,
-	attempts = {},
-	lastAttemptAt = 0,
-	lastJob = nil,
-	pending = false,
-	announcedJob = nil,
-}
-
-local function setStatus(text, color)
-	ui.status.Text = text
-	ui.status.TextColor3 = color
-	ui.dot.BackgroundColor3 = color
-end
-
-local function setInfo(info)
-	if not info then
-		ui.info.Text = string.format("You: %s (@%s)\nNo host info yet.", myDisplay, myUsername)
-		return
-	end
-	ui.info.Text = string.format(
-		"You: %s (@%s)\nHost: %s (@%s)\nGame: %s\nPlace: %d\nJob: %s",
-		myDisplay,
-		myUsername,
-		info.display ~= "" and info.display or info.username,
-		info.username,
-		info.game,
-		info.place,
-		info.job
-	)
-end
-
-local function currentJobId()
-	local ok, job = pcall(function()
-		return game.JobId
-	end)
-	if ok and type(job) == "string" then
-		return job
-	end
-	return ""
-end
-
-local function joinLink(info)
-	return string.format("roblox://join?placeId=%d&gameInstanceId=%s", info.place, info.job)
-end
-
-local function offerFallback(info)
-	if not info then
-		return
-	end
-	local link = joinLink(info)
-	local copied = copyToClipboard(link)
-	print("[Server Joiner] manual join link: " .. link)
-	ui.info.Text = "Manual link:\n" .. link
-	setStatus(copied and "Join link copied to clipboard. Open it to join." or "Join link printed to the console.", THEME.amber)
-end
-
-local function attemptJoin(info)
-	if not state.running or not info then
-		return
-	end
-
-	if tonumber(game.PlaceId) == info.place and currentJobId() == info.job then
-		-- Already inside: tell the host once, so a host script started later
-		-- knows who is here, and start the session here instead of teleporting
-		-- to the server we are already sitting in.
-		if state.announcedJob ~= info.job then
-			state.announcedJob = info.job
-			hostUsername = info.username
-			hostDisplay = info.display
-			publishPresence(info)
-			if CONFIG.RUN_SESSION_AFTER_JOIN and startSessionHere() then
-				setStatus("You are already in " .. info.username .. "'s server. Session started.", THEME.green)
-			else
-				setStatus("You are already in " .. info.username .. "'s server. Announced yourself to the host.", THEME.green)
-			end
-		else
-			setStatus("You are already in " .. info.username .. "'s server.", THEME.green)
-		end
-		return
-	end
-
-	local attempts = state.attempts[info.job] or 0
-	if attempts >= CONFIG.MAX_ATTEMPTS then
-		setStatus("Gave up on this server after " .. attempts .. " attempts. Press Join now to retry.", THEME.red)
-		return
-	end
-	if os.time() - state.lastAttemptAt < CONFIG.RETRY_SECONDS then
-		return
-	end
-
-	state.attempts[info.job] = attempts + 1
-	state.lastAttemptAt = os.time()
-	state.lastJob = info.job
-	state.pending = true
-
-	setStatus("Joining " .. info.game .. " on " .. info.display .. "'s server...", THEME.amber)
-
-	hostUsername = info.username
-	hostDisplay = info.display
-
-	-- Tell the host who is coming before the teleport happens. This is what
-	-- lets host.lua watch the Players list for the right username.
-	publishPresence(info)
-
-	-- Queue before the teleport: this environment is thrown away, the queued
-	-- source is what runs in the server we land in.
-	if CONFIG.RUN_SESSION_AFTER_JOIN then
-		if not queueSession() then
-			print("[Server Joiner] could not queue the session script; the host will not be answered")
-		end
-	end
-
-	local ok, err = pcall(function()
-		TeleportService:TeleportToPlaceInstance(info.place, info.job, Players.LocalPlayer)
-	end)
-
-	if not ok then
-		clearQueuedScript()
-		offerFallback(info)
-		return
-	end
-
-	-- The teleport is asynchronous: if nothing changes in 14 seconds, the
-	-- request did not go through, so say so instead of sitting on "Joining...".
-	spawnThread(function()
-		waitSeconds(14)
-		if not state.running or not state.pending then
-			return
-		end
-		if state.lastJob ~= info.job then
-			return
-		end
-		if tonumber(game.PlaceId) == info.place and currentJobId() == info.job then
-			return
-		end
-		if tonumber(game.PlaceId) == info.place then
-			state.pending = false
-			clearQueuedScript()
-			setStatus("Teleport did not start. The server may be full, restricted or gone.", THEME.red)
-		end
-	end)
-end
-
-ui.join.MouseButton1Click:Connect(function()
-	if not state.info then
-		setStatus("No server info yet - waiting for the host to run host.lua.", THEME.amber)
-		return
-	end
-	state.attempts[state.info.job] = 0
-	state.lastAttemptAt = 0
-	state.pending = false
-	attemptJoin(state.info)
+	ui.gui = gui
 end)
 
-ui.stop.MouseButton1Click:Connect(function()
-	state.running = false
-	ui.gui:Destroy()
-	print("[Server Joiner] stopped listening room '" .. room .. "'")
-end)
-
---------------------------------------------------------------------------
--- Listen
---------------------------------------------------------------------------
-
-if not httpAvailable then
-	setStatus("This executor does not expose HTTP requests, so it cannot listen.", THEME.red)
-	print("[Server Joiner] this executor does not expose HTTP requests")
-	return
+if not cardOk then
+	print("[Trade] could not draw the card: " .. tostring(cardErr))
 end
 
-if CONFIG.RUN_SESSION_AFTER_JOIN then
-	if queueOnTeleport then
-		print("[Server Joiner] " .. queueName .. " found: the trading session will run in the host's server")
+cardStatus = setStatus
+cardInfo = setInfo
+
+findTheHost()
+
+setStatus("CONNECTED to " .. hostDisplay .. " (" .. hostUsername .. ")", THEME.green)
+setInfo("Waiting for the host's trade request")
+print("[Trade] CONNECTED to " .. hostDisplay .. " (" .. hostUsername .. ") - waiting for the trade request")
+print("[Trade] link: " .. linkState() .. " - the relay is only a helper, the trade runs on the trade window and the clock")
+
+--------------------------------------------------------------------------
+-- Trade driver
+--------------------------------------------------------------------------
+
+-- Say hello on the channel straight away: that hello is what makes the host
+-- say CONNECTED and start the trade. The host needs no timer of its own.
+startRelayLoop()
+print("[Trade] link: " .. linkState() .. " (channel " .. channelCode .. ")")
+
+print(string.format(
+	"[Trade] session %s running in place %s, job %s, host %s",
+	BUILD,
+	tostring(game.PlaceId),
+	tostring(myJob),
+	tostring(hostDisplay)
+))
+
+-- A wrong path would mean the press happens nowhere, so the real contents of
+-- this client's trade window are printed once. It also proves the script never
+-- hides or deletes anything: every element listed is still there.
+local treeDumped = false
+local function dumpTradeTree()
+	if treeDumped then
+		return
+	end
+	local root = tradeGui()
+	if root == nil then
+		return
+	end
+	treeDumped = true
+	local lines = {}
+	local function walk(instance, depth, prefix)
+		if depth > 4 or #lines > 40 then
+			return
+		end
+		local ok, children = pcall(function()
+			return instance:GetChildren()
+		end)
+		if not ok or children == nil then
+			return
+		end
+		for _, child in ipairs(children) do
+			lines[#lines + 1] = prefix .. tostring(child.Name)
+			walk(child, depth + 1, prefix .. "  ")
+		end
+	end
+	walk(root, 1, "  ")
+	print("[Trade] TradeGUI contents:\n" .. table.concat(lines, "\n"))
+end
+
+-- List the trade remotes once, so the console shows what the game exposes.
+-- If you ever need to press accept or confirm through a remote instead of a
+-- button, this is the list to look at.
+do
+	local ok, folder = pcall(function()
+		return ReplicatedStorage:FindFirstChild("Trade")
+	end)
+	if ok and folder ~= nil then
+		local names = {}
+		for _, child in ipairs(folder:GetChildren()) do
+			names[#names + 1] = tostring(child.Name)
+		end
+		print("[Trade] Trade remotes: " .. table.concat(names, ", "))
 	else
-		print("[Server Joiner] this executor has no queue_on_teleport, so nothing can run after the teleport")
-		setStatus("This executor cannot run a script after the teleport, so the host's trade cannot be answered.", THEME.amber)
+		print("[Trade] ReplicatedStorage.Trade was not found")
 	end
 end
 
-pcall(function()
-	TeleportService.TeleportInitFailed:Connect(function(player, result, messageText)
-			if player ~= Players.LocalPlayer or not state.pending then
+-- One full trade with the host, from an open trade window to a confirmed
+-- trade. Returns "ok" when the cycle completed, "retry" when it has to be
+-- handed back to the host, and "stop" when this session is over.
+local function runWindowTrade(cycleNumber)
+	dumpTradeTree()
+	print("[Trade] cycle " .. tostring(cycleNumber) .. ": the trade window is open - the host's request landed")
+
+	-- Watch the window for the rest of the cycle, so the console says exactly
+	-- when and why it went away instead of leaving it to guesswork.
+	local windowOpenedAt = now()
+	local acceptPressedAt = nil
+	local watchWindow = true
+	spawnFn(function()
+		local wasOpen = tradeGui() ~= nil
+		while watchWindow and not finished do
+			-- If anything switches the window off during the trade, put it back
+			-- so the accept and confirm presses land where they should.
+			ensureTradeWindowShown()
+			local isOpen = tradeGui() ~= nil
+			if wasOpen and not isOpen then
+				local sinceOpen = now() - windowOpenedAt
+				if acceptPressedAt ~= nil then
+					print(string.format(
+						"[Trade] cycle %d: the trade window closed %.1fs after it opened, %.1fs after the accept press",
+						cycleNumber,
+						sinceOpen,
+						now() - acceptPressedAt
+					))
+				else
+					print(string.format(
+						"[Trade] cycle %d: the trade window closed %.1fs after it opened, before accept was pressed",
+						cycleNumber,
+						sinceOpen
+					))
+				end
 				return
 			end
-			state.pending = false
-			clearQueuedScript()
-			setStatus("Teleport failed: " .. tostring(messageText) .. " (" .. tostring(result) .. ")", THEME.red)
-			offerFallback(state.info)
-		end)
+			wasOpen = isOpen
+			waitFn(0.1)
+		end
 	end)
 
-setInfo(nil)
-
-spawnThread(function()
-	while state.running do
-		local hosts, status = findLiveHosts()
-
-		if hosts then
-			local latest = hosts[#hosts]
-			if latest then
-				state.info = latest
-				setInfo(latest)
-				if CONFIG.AUTO_JOIN then
-					attemptJoin(latest)
-				else
-					setStatus("Host found - press Join now.", THEME.green)
-				end
-			else
-				state.info = nil
-				setInfo(nil)
-				setStatus("No host is running right now - waiting for one to start...", THEME.amber)
-			end
-		elseif status == 429 then
-			setStatus("Relay is rate limiting this network. Slowing down...", THEME.amber)
-			waitSeconds(10)
-		else
-			setStatus("Could not reach the relay (error " .. tostring(status) .. "). Retrying...", THEME.red)
-		end
-
-		waitSeconds(CONFIG.POLL_SECONDS)
+	-- The host adds its items 2s after this side accepted. This side watches its
+	-- own window for them, which is the same moment the host sees, so both sides
+	-- count from the same event instead of drifting apart.
+	print("[Trade] cycle " .. tostring(cycleNumber) .. ": waiting for the host to add its items")
+	setStatus(string.format("Cycle %d: waiting for the host's items", cycleNumber), THEME.amber)
+	local itemReason, itemsInAt = waitForHostItems(cycleNumber)
+	if itemReason == "stopped" then
+		watchWindow = false
+		return "stop"
 	end
-end)
+	if itemReason == "window closed" then
+		-- The trade was cancelled before any item went in. Hand the same cycle
+		-- back to the host instead of losing it.
+		watchWindow = false
+		print("[Trade] cycle " .. tostring(cycleNumber) .. ": the trade window closed before the host added anything - starting over")
+		tellNowindow(cycleNumber)
+		return "retry"
+	end
 
-if type(getgenv) == "function" then
-	getgenv().ServerShareJoinerGui = ui.gui
+	local itemNote = "the host's items are in"
+	if itemReason == "relay" then
+		itemNote = "the host says its items are in"
+	elseif itemReason == "timer" then
+		itemNote = "no items visible here, going by the clock"
+	end
+	print(string.format("[Trade] cycle %d: %s", cycleNumber, itemNote))
+
+	-- The host presses accept six seconds after its last item. Both clients saw
+	-- that item land, so this side can press one second after the host's moment
+	-- without waiting for a message. That is the whole point: the presses stay in
+	-- the right order even when the relay is not answering.
+	local goAt = itemsInAt + ACCEPT_DELAY + ACCEPT_GO_DELAY
+
+	if itemReason == "timer" then
+		-- Nothing showed up in the window here, so the host's own word is the
+		-- only clock there is. It is used if it comes; the deadline holds anyway.
+		while not finished and now() < goAt do
+			local entry = sync.events["acceptgo"]
+			if entry ~= nil and entry.cycle >= cycleNumber then
+				goAt = math.min(goAt, now() + ACCEPT_GO_DELAY)
+				print("[Trade] cycle " .. tostring(cycleNumber) .. ": the host says it is accepting now")
+				break
+			end
+			waitFn(0.2)
+		end
+	end
+
+	print(string.format(
+		"[Trade] cycle %d: accepting in %.1fs (the host presses 1s before that)",
+		cycleNumber,
+		math.max(0, goAt - now())
+	))
+	while not finished and now() < goAt do
+		setStatus(string.format("Cycle %d: accepting in %ss...", cycleNumber, tostring(math.ceil(math.max(0, goAt - now())))), THEME.green)
+		waitFn(math.min(0.2, math.max(0, goAt - now())))
+	end
+	if finished then
+		watchWindow = false
+		return "stop"
+	end
+
+	acceptPressedAt = now()
+	setStatus(string.format("Cycle %d: pressing accept...", cycleNumber), THEME.green)
+	local accepted, acceptSignal = acceptTheTrade()
+	if not accepted then
+		-- This side never actually agreed to the items, so confirming would only
+		-- close (or cancel) a trade nobody agreed to. Hand the cycle back.
+		print(string.format(
+			"[Trade] cycle %d: the items were NOT accepted (%s) - not confirming",
+			cycleNumber,
+			tostring(acceptSignal)
+		))
+		publish("accept", cycleNumber, "notaccepted")
+		watchWindow = false
+		return "retry"
+	end
+	print(string.format("[Trade] cycle %d: accepted the items (%s)", cycleNumber, tostring(acceptSignal)))
+	publish("accept", cycleNumber, "ok")
+
+	waitFn(CONFIRM_DELAY)
+	setStatus(string.format("Cycle %d: confirmed, waiting for the trade to close", cycleNumber), THEME.green)
+	local confirmed, confirmSignal = pressConfirm()
+	if confirmed then
+		print(string.format("[Trade] cycle %d: pressed confirm once (%s)", cycleNumber, tostring(confirmSignal)))
+	end
+
+	-- A trade only completes when both sides confirm, so if the window is still
+	-- up a few seconds later the host's confirm had not landed yet. Press once
+	-- more rather than leaving this side half-done.
+	local recheck = now() + 4
+	while not finished and now() < recheck and tradeGui() ~= nil do
+		waitFn(0.25)
+	end
+	if tradeGui() ~= nil then
+		print("[Trade] cycle " .. tostring(cycleNumber) .. ": the window is still open - pressing confirm once more")
+		pressConfirm()
+	end
+
+	-- The window closing is what ends this cycle, and the host sends the next
+	-- request about half a second after it.
+	local closedBy = now() + 5
+	while not finished and now() < closedBy and tradeGui() ~= nil do
+		waitFn(0.2)
+	end
+	watchWindow = false
+
+	print(string.format("=== cycle %d finished ===", cycleNumber))
+	return "ok"
 end
 
-print("[Server Joiner] listening on room '" .. room .. "' as " .. myUsername)
+-- The cycle loop. Every request the host sends starts one cycle, and a cycle
+-- that never became a trade is handed back to the host instead of being lost:
+-- it sends the same request again and this side picks it straight back up.
+local cycle = 0
+while not finished do
+	local wanted = cycle + 1
+
+	local trigger = waitForRequest(wanted)
+	if trigger == nil then
+		break
+	end
+
+	print(string.format("[Trade] cycle %d: the host sent the request (%s) - accepting it in %ss", wanted, trigger, tostring(REQUEST_DELAY)))
+	setStatus(string.format("Cycle %d: host sent the request - accepting", wanted), THEME.amber)
+	-- A fresh request means a fresh attempt: the previous attempt's "items"
+	-- message must not be mistaken for this one's.
+	sync.events["items"] = nil
+	sync.events["acceptgo"] = nil
+	waitFn(REQUEST_DELAY)
+	fireAcceptRequest()
+
+	-- The host waits for this before it adds anything: it is the proof that the
+	-- trade window really opened, so its items land in a live trade instead of
+	-- going into a request that never got through.
+	local windowOpen = waitForTradeWindow(WINDOW_WAIT)
+	if not windowOpen then
+		-- The request expired, or the accept never reached the game. Try the
+		-- accept once more before handing the cycle back: a request that is
+		-- still pending does not need a brand new one.
+		print("[Trade] cycle " .. tostring(wanted) .. ": the trade window did not open - asking the host to send it again")
+		tellNowindow(wanted)
+		waitFn(REQUEST_RETRY_SECONDS)
+		fireAcceptRequest()
+		windowOpen = waitForTradeWindow(WINDOW_WAIT)
+	end
+
+	if not windowOpen then
+		-- Stay on this cycle number: the host resends the request under the same
+		-- number, and the next wait treats that message as a new request.
+		print("[Trade] cycle " .. tostring(wanted) .. ": still no trade window - waiting for the host's next request")
+		tellNowindow(wanted)
+		waitFn(REQUEST_RETRY_WAIT)
+	else
+		-- Tell the host the request is accepted, so it starts its own 2 second
+		-- wait. Its window opens at the same instant, so a message lost to the
+		-- relay's rate limit costs nothing: the host sees the same window.
+		publish("reqok", wanted, "open")
+		print("[Trade] cycle " .. tostring(wanted) .. ": told the host the request was accepted")
+		setInfo(string.format("Cycle %d: trade open - waiting for the host's items", wanted))
+
+		local outcome = runWindowTrade(wanted)
+		if outcome == "stop" then
+			break
+		elseif outcome == "retry" then
+			-- Same cycle number: the host resends the request under it.
+			waitFn(REQUEST_RETRY_WAIT)
+		else
+			cycle = wanted
+		end
+	end
+end
+
+--------------------------------------------------------------------------
+-- That is the end of the run
+--------------------------------------------------------------------------
+
+
+if finished then
+	print("[Trade] every cycle is done - the host has nothing left to give")
+	setStatus("Finished - every item is traded", THEME.green)
+	setInfo("The host has nothing left to give")
+else
+	print("[Trade] the host went quiet or this session was stopped")
+	setStatus("Stopped - the host went quiet", THEME.amber)
+end
