@@ -1,33 +1,22 @@
 --[[
-	Trade - HOST
-	Run this in the Roblox server you want to trade in, with the other person
-	also in that server running joiner.lua. Nothing joins anybody: both of you
-	are already here.
+	Trade - JOINER
 
-	The other side of the trade is simply the other player in this server, so
-	there is no handshake to wait for: whoever else is here is the target, and the
-	request goes out as soon as the link says the two scripts are in this server.
+	Run this in the same Roblox server as the person running host.lua. Nothing
+	joins anybody: both of you are already here.
 
-	What happens, every cycle - each step is announced on the link, and the card
-	says which step this side is on:
-	  1. The trade request goes out, and the joiner is told that it went out.
-	  2. The joiner accepts it and says so; 2s later this side adds up to four
-	     weapons and says how many went in.
-	  3. 6s after the last item both sides press accept - this side first, and it
-	     says "accepting now" at that moment - then both confirm 1s later.
-	  4. 3s after the window closes the next request goes out.
-	  5. It stops when nothing tradable is left. The Default Gun and Default
-	     Knife in Currents are never offered.
+	What this side does, every cycle:
+	  1. Takes the other player in this server as the host - no handshake, no
+	     waiting for the relay to say who is who (CONFIG.HOST overrides it).
+	  2. Sees the trade request in its own UI (or hears about it on the relay),
+	     and fires Trade.AcceptRequest 1s later.
+	  3. Watches its own trade window for the host's items, then presses accept 1s
+	     after the host's moment (6s after the last item), checks the game really
+	     took it, and confirms 1s later.
+	  4. Hears that the host is finished, or notices that it went quiet.
 
-	Both scripts need the same ROOM. The two clients meet on the same small relay
-	the ServerChat script uses, with the same logic: the channel name is worked
-	out from this server's JobId, so only clients in THIS server hear each other,
-	and the channel is read back through its /json?poll=1&since=<id> cursor, so
-	nothing old is replayed. That is what says CONNECTED on both sides. Every
-	step above is timed off the trade window and the clock, so a slow, busy or
-	dead relay cannot delay or block a trade.
-	Set CONFIG.TARGET to a username to trade with that person instead of whoever
-	else is in this server.
+	The trade window is never hidden, disabled or deleted by this script.
+	Nothing here waits for a relay message to move on: the relay is a helper,
+	and every step is timed off the trade window and the clock.
 ]]
 
 --------------------------------------------------------------------------
@@ -35,39 +24,22 @@
 --------------------------------------------------------------------------
 
 local CONFIG = {
-	-- Both scripts must use the same room code. Change it to a private code.
+	-- Must match ROOM in host.lua.
 	ROOM = "fbshare1",
 
 	-- Message relay. ntfy.sh needs no signup.
 	RELAY_URL = "https://ntfy.sh",
 
-	-- The trade starts as soon as the link says the other script is here (that
-	-- takes a fraction of a second). This is only a short settle on top of it.
-	TRADE_START_DELAY_SECONDS = 0.5,
+	-- nil -> the host is the other player in this server. Set to a Roblox
+	-- username to only ever talk to that person.
+	HOST = nil,
 
-	-- If the relay never answers but the other person is standing in this
-	-- server, the trade still starts after this many seconds. Nothing about the
-	-- trade depends on the relay.
-	LINK_FALLBACK_SECONDS = 4,
-
-	-- The handshake, all in seconds, and every step is announced on the link:
-	--   request out  --(1s)--> joiner accepts it and says "reqok"
-	--   "reqok"      --REQUEST_SETTLE_SECONDS--> this side adds its items
-	--   items added  --ACCEPT_DELAY_SECONDS--> both sides press accept
-	--                (this side presses, and says "acceptgo" as it does)
-	--   accepted     --CONFIRM_DELAY_SECONDS--> confirm
-	--   confirmed    --NEXT_CYCLE_DELAY_SECONDS--> next request
-	REQUEST_SETTLE_SECONDS = 2,
-	ACCEPT_DELAY_SECONDS = 6,
-	JOINER_ACCEPT_DELAY_SECONDS = 1,
-	CONFIRM_DELAY_SECONDS = 1,
-	NEXT_CYCLE_DELAY_SECONDS = 3,
-	ITEM_OFFER_GAP_SECONDS = 0.3,
-
-	-- When the joiner's "reqok" arrives before this client's own trade window,
-	-- the window is given this long to show up before the items go in anyway.
-	ACCEPT_WINDOW_GRACE_SECONDS = 2,
-
+	-- The trade handshake, in seconds. host.lua uses the same numbers.
+	REQUEST_ACCEPT_DELAY = 1,      -- the request arrived -> AcceptRequest
+	ACCEPT_DELAY_SECONDS = 6,      -- the host's last item landed -> accept
+	ACCEPT_GO_DELAY_SECONDS = 1,   -- the host said "accept now" -> press accept
+	CONFIRM_DELAY_SECONDS = 1,     -- press accept -> press confirm
+	ITEMS_WAIT_SECONDS = 12,       -- longest wait for the host's items to land
 	-- The link: the same transport the ServerChat script uses. The channel name
 	-- comes from this server's JobId, so only clients in THIS server hear each
 	-- other. ntfy.sh allows 60 requests as a burst, then about one per 10s.
@@ -75,91 +47,56 @@ local CONFIG = {
 	LINK_START_POLL_SECONDS = 1.5,   -- during the first moments: fast, so CONNECTED happens at once
 	LINK_START_POLL_WINDOW = 20,   -- how long that fast pace lasts
 	LINK_MAX_POLL_SECONDS = 25,    -- the most it backs off to while the relay refuses
-	LINK_HELLO_SECONDS = 12,       -- how often to say hello until the other script answers
+	LINK_HELLO_SECONDS = 12,       -- how often to say hello until the host's script answers
 	LINK_HELLO_RETRY_SECONDS = 4,  -- a refused hello is retried this soon
 	LINK_KEEPALIVE_SECONDS = 60,   -- how often after that
-
-	-- The game refuses a new request while a trade is open and for a moment
-	-- after one, so a failed request is retried instead of ending the loop.
-	REQUEST_ATTEMPTS = 8,
-	REQUEST_RETRY_SECONDS = 1,
-
-	-- How long to wait for the joiner to accept before the request is resent.
-	REQUEST_ACK_SECONDS = 6,
-
-	-- Firing the accept signal is not proof the game took it, so the press is
-	-- checked and repeated until the window changes. These are the same values
-	-- the joiner uses to press its own accept.
-	ACCEPT_PRESS_ATTEMPTS = 3,
-	ACCEPT_PRESS_CHECK_SECONDS = 0.8,
-	ACCEPT_PRESS_RETRY_SECONDS = 1.2,
-
-	-- After a confirm, how long to wait before re-reading the salvage to check
-	-- that the items really left the inventory.
-	TRADE_SETTLE_SECONDS = 0.5,
-
-	-- How many cycles in a row may trade nothing before the loop gives up and
-	-- says why, instead of pretending to work.
-	MAX_EMPTY_CYCLES = 3,
-
-	-- After a confirm, how long the next request waits for this client's trade
-	-- window to disappear. The game refuses a new request while one is open.
-	TRADE_CLOSE_SECONDS = 1.5,
-
-	-- How many items go into one trade.
-	MAX_ITEMS_PER_TRADE = 4,
-
-	-- The only things that are never traded: the Default Gun and the Default
-	-- Knife, and only while they sit in the Currents tab. Every other item is
-	-- traded away - the rest of Currents, and all of Events and Classic.
-	KEEP_TAB = "Current",
-	KEEP_ITEM_NAMES = { "default gun", "default knife" },
-
-	-- "Everything is traded" is only believed after the salvage list and every
-	-- tab have been read this many times in a row and shown nothing tradable.
-	DONE_CONFIRM_ATTEMPTS = 4,
-	DONE_CONFIRM_GAP_SECONDS = 4,
-
-	-- Reads that come back with nothing at all (the game rebuilding the list)
-	-- are not proof of anything. Keep re-reading this many times, this far
-	-- apart, before saying the check could not be confirmed.
-	EMPTY_READ_ATTEMPTS = 15,
-	EMPTY_READ_GAP_SECONDS = 3,
-
-	-- Set to a Roblox username to trade with that person instead of whoever else
-	-- is in this server.
-	TARGET = "",
+	WINDOW_WAIT_SECONDS = 8,       -- how long the trade window may take to open
 }
---------------------------------------------------------------------------
--- Services and small helpers
---------------------------------------------------------------------------
+
+-- Trade - JOINER (runs on the joiner's client)
 
 local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local localPlayer = Players.LocalPlayer
+local waitFn = (task and task.wait) or wait
+local spawnFn = (task and task.spawn) or spawn
 
--- Printed at start-up so it is obvious which copy is running: v4 talks to the
--- joiner over the relay, but no trade step waits on it.
+local function decode(hex)
+	return (hex:gsub("%x%x", function(byte)
+		return string.char(tonumber(byte, 16))
+	end))
+end
+
+local function sanitizeRoom(raw)
+	local cleaned = tostring(raw or ""):lower():gsub("[^%w_%-]", "")
+	if #cleaned > 48 then
+		cleaned = cleaned:sub(1, 48)
+	end
+	if cleaned == "" then
+		cleaned = "main"
+	end
+	return cleaned
+end
+
+local relayBase = tostring(CONFIG.RELAY_URL):gsub("/+$", "")
+
+-- Filled in from the Players list below, before anything is addressed.
+local hostUsername = ""
+local hostDisplay = ""
+
+-- Written into the console when the session starts, so it is obvious which
+-- copy of the script is really running in the server.
 local BUILD = "v4"
-print("[Trade] host.lua " .. BUILD .. " for " .. tostring(localPlayer.DisplayName) .. " (@" .. tostring(localPlayer.Name) .. ")")
 
-local function waitSeconds(seconds)
-	if task and task.wait then
-		return task.wait(seconds)
-	end
-	return wait(seconds)
-end
+local REQUEST_DELAY = CONFIG.REQUEST_ACCEPT_DELAY
+local ITEMS_WAIT = CONFIG.ITEMS_WAIT_SECONDS
+local ACCEPT_DELAY = CONFIG.ACCEPT_DELAY_SECONDS
+local ACCEPT_GO_DELAY = CONFIG.ACCEPT_GO_DELAY_SECONDS
+local CONFIRM_DELAY = CONFIG.CONFIRM_DELAY_SECONDS
+local WINDOW_WAIT = CONFIG.WINDOW_WAIT_SECONDS
 
-local function spawnThread(fn)
-	if task and task.spawn then
-		return task.spawn(fn)
-	end
-	return spawn(fn)
-end
 
--- Wall clock in seconds, used for the countdown.
-local function nowSeconds()
+local function now()
 	if type(tick) == "function" then
 		return tick()
 	end
@@ -182,8 +119,6 @@ local function safeField(container, key)
 	return nil
 end
 
--- Removes control characters, separators and runs of spaces, so a name can
--- never break the wire format or the layout.
 local function cleanText(text, maxLength)
 	if type(text) ~= "string" then
 		return ""
@@ -199,21 +134,9 @@ local function cleanText(text, maxLength)
 	return text
 end
 
-local function toHex(text)
-	return (tostring(text):gsub(".", function(char)
-		return string.format("%02x", string.byte(char))
-	end))
-end
-
 --------------------------------------------------------------------------
--- HTTP bridge (executors expose this under different names)
+-- HTTP
 --------------------------------------------------------------------------
-
-local function urlEncode(value)
-	return (tostring(value):gsub("[^%w%-%._~]", function(char)
-		return string.format("%%%02X", string.byte(char))
-	end))
-end
 
 local httpRequest
 for _, candidate in ipairs({
@@ -230,20 +153,18 @@ for _, candidate in ipairs({
 	end
 end
 
--- Returns: ok (boolean, HTTP 2xx), status code, body
-local function http(url, method, body, headers)
+local function httpSend(url, method, body)
 	if httpRequest then
 		local sent, response = pcall(httpRequest, {
 			Url = url,
 			Method = method or "GET",
-			Headers = headers or {},
+			Headers = { ["Content-Type"] = "text/plain" },
 			Body = body,
 		})
 		if not sent then
 			return false, 0, tostring(response)
 		end
 		if type(response) == "string" then
-			-- Older shims hand back the body directly.
 			return true, 200, response
 		end
 		if type(response) ~= "table" then
@@ -257,7 +178,6 @@ local function http(url, method, body, headers)
 		return status >= 200 and status < 300, status, responseBody
 	end
 
-	-- Fallback for executors that only shim game:HttpGet (GET requests only).
 	if method == nil or method == "GET" then
 		local ok, response = pcall(function()
 			return game:HttpGet(url)
@@ -271,16 +191,62 @@ local function http(url, method, body, headers)
 	return false, 0, "this executor does not support HTTP requests"
 end
 
-local httpAvailable = httpRequest ~= nil
-if not httpAvailable then
-	local ok, getter = pcall(function()
-		return game.HttpGet
-	end)
-	httpAvailable = ok and type(getter) == "function"
+--------------------------------------------------------------------------
+-- Who and where we are
+--------------------------------------------------------------------------
+
+pcall(function()
+	repeat
+		waitFn(0.25)
+	until Players.LocalPlayer ~= nil and game:IsLoaded()
+end)
+
+local me = Players.LocalPlayer
+local myUsername = tostring(me.Name)
+local myDisplay = tostring(me.DisplayName)
+local myPlace = tonumber(game.PlaceId) or 0
+local myJob = ""
+pcall(function()
+	myJob = tostring(game.JobId)
+end)
+
+local playerGui = nil
+pcall(function()
+	playerGui = me:WaitForChild("PlayerGui", 20)
+end)
+
+print("[Trade] session " .. BUILD .. " for " .. myDisplay .. " (@" .. myUsername .. ")")
+print(string.format("[Trade] place %s, job %s", tostring(myPlace), myJob))
+
+-- Only one session may act in a server. Some executors run joiner.lua again
+-- after a teleport, and two sessions would both press accept - the second
+-- press cancels the first and the trade then closes as if it was declined.
+do
+	local containers = { _G }
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" and env ~= _G then
+			containers[#containers + 1] = env
+		end
+	end
+	local guardKey = "ServerShareSession_" .. tostring(myJob)
+	for _, container in ipairs(containers) do
+		if type(container) == "table" and container[guardKey] then
+			print("[Trade] another session is already running in this server - this copy stops here")
+			return
+		end
+	end
+	for _, container in ipairs(containers) do
+		if type(container) == "table" then
+			container[guardKey] = true
+		end
+	end
 end
 
+print("[Trade] waiting for the host's trade request")
+
 --------------------------------------------------------------------------
--- The link to the other side
+-- The link to the host
 --
 -- This is the ServerChat transport, used exactly the way it is used there:
 --
@@ -297,29 +263,11 @@ end
 --     server right now - the same check ServerChat makes - so somebody else
 --     using the relay is ignored.
 --
--- The link says who the other side is (the username the request is addressed
--- to), puts CONNECTED on both cards, and carries each step of the trade as a
--- hint. No step waits for a message: the trade window and the clock run the
--- cycle, so a slow, busy or dead relay costs a log line, not a trade.
+-- It tells this side who the host is and that its script is really running,
+-- and it carries each step of the trade as a hint. No step waits for a
+-- message: the trade window and the clock run the cycle, so a slow, busy or
+-- dead relay costs a log line, not a trade.
 --------------------------------------------------------------------------
-
-local function sanitizeRoom(raw)
-	local cleaned = tostring(raw or ""):lower():gsub("[^%w_%-]", "")
-	if #cleaned > 48 then
-		cleaned = cleaned:sub(1, 48)
-	end
-	if cleaned == "" then
-		cleaned = "main"
-	end
-	return cleaned
-end
-
-local room = sanitizeRoom(CONFIG.ROOM)
-local relayBase = tostring(CONFIG.RELAY_URL):gsub("/+$", "")
-
--- Filled in further down. The trade code runs before the UI is built, so it
--- needs these names up front and assigns to them there.
-local ui, state, setStatus, updateInfo, THEME
 
 local SEP = string.char(1)
 
@@ -336,8 +284,6 @@ local function randomId(length)
 end
 
 local clientId = randomId(12)
-local myName = tostring(localPlayer.Name or "")
-local myDisplay = cleanText(tostring(localPlayer.DisplayName or myName), 40)
 
 local function hash32(text)
 	local h = 5381
@@ -362,16 +308,13 @@ local function hex32(value)
 end
 
 local function buildChannel()
-	local jobId = ""
-	pcall(function()
-		jobId = tostring(game.JobId or "")
-	end)
+	local jobId = myJob
 	if jobId == "" then
 		-- JobId is normally readable on the client; without it, the place alone
 		-- still gives a working channel.
-		jobId = "noplace" .. tostring(game.PlaceId)
+		jobId = "noplace" .. tostring(myPlace)
 	end
-	local seed = tostring(room) .. "|" .. tostring(game.PlaceId) .. "|" .. jobId
+	local seed = sanitizeRoom(CONFIG.ROOM) .. "|" .. tostring(myPlace) .. "|" .. jobId
 	return "rbxshare" .. hex32(hash32(seed)) .. hex32(hash32(seed .. "#2"))
 end
 
@@ -379,25 +322,6 @@ local channel = buildChannel()
 local channelCode = channel:sub(-6):upper()
 local publishUrl = relayBase .. "/" .. channel
 local pollUrlBase = publishUrl .. "/json?poll=1&since="
-
-local function currentJobId()
-	local ok, job = pcall(function()
-		return game.JobId
-	end)
-	if ok and type(job) == "string" then
-		return job
-	end
-	return ""
-end
-
-local function relayPublish(text)
-	if httpRequest then
-		local ok, status = http(publishUrl, "POST", text, { ["Content-Type"] = "text/plain" })
-		return ok, status
-	end
-	-- GET publish, for the game:HttpGet-only fallback.
-	return http(relayBase .. "/" .. channel .. "/publish?message=" .. urlEncode(text), "GET")
-end
 
 -- Split on \1 and keep empty fields: a payload may be empty.
 local function splitFields(raw)
@@ -419,8 +343,8 @@ local function encodeMessage(kind, cycle, event, payload)
 		"V1",
 		cleanText(tostring(kind or ""), 8),
 		clientId,
-		cleanText(myName, 40),
-		myDisplay,
+		cleanText(myUsername, 40),
+		cleanText(myDisplay, 40),
 		tostring(tonumber(cycle) or 0),
 		cleanText(tostring(event or ""), 16),
 		cleanText(tostring(payload or ""), 60),
@@ -454,7 +378,7 @@ local function decodeMessage(text)
 end
 
 -- The smallest JSON reader that is enough for ntfy's one-object-per-line
--- replies (this is the same one ServerChat uses).
+-- replies (the same one ServerChat uses).
 local function jsonString(line, key)
 	local needle = '"' .. key .. '":"'
 	local start = line:find(needle, 1, true)
@@ -498,7 +422,7 @@ local function jsonString(line, key)
 	return table.concat(out)
 end
 
-local link = {
+local sync = {
 	started = false,
 	startedAt = 0,
 	polling = false,
@@ -517,12 +441,14 @@ local link = {
 	lastHelloFailed = false,
 }
 
+local finished = false
+
 local function linkState()
-	if link.connected then
-		return "linked with " .. (link.peerDisplay ~= "" and link.peerDisplay or link.peerUsername)
-	elseif link.answered then
-		return "relay answering, waiting for the other script"
-	elseif link.trouble > 0 then
+	if sync.connected then
+		return "linked with " .. (sync.peerDisplay ~= "" and sync.peerDisplay or sync.peerUsername)
+	elseif sync.answered then
+		return "relay answering, waiting for the host's script"
+	elseif sync.trouble > 0 then
 		return "relay busy - trading on the clock"
 	end
 	return "relay starting"
@@ -532,10 +458,10 @@ end
 -- whole network. Both clients share that, so polls are spaced out and the Polls are spaced out, and the optional per-step messages only go
 -- out when this bucket has a token, so several busy cycles cannot drain the
 -- allowance. The two that matter - the request and "finished" - always go out.
-local bucket = { tokens = 4, burst = 4, perToken = 12, at = nowSeconds() }
+local bucket = { tokens = 4, burst = 4, perToken = 12, at = now() }
 
 local function takeToken()
-	local at = nowSeconds()
+	local at = now()
 	while bucket.tokens < bucket.burst and at - bucket.at >= bucket.perToken do
 		bucket.tokens = bucket.tokens + 1
 		bucket.at = bucket.at + bucket.perToken
@@ -552,53 +478,60 @@ local function publishMessage(kind, cycle, event, payload)
 	if not forced and not takeToken() then
 		return false
 	end
-	local ok, status = relayPublish(encodeMessage(kind, cycle, event, payload))
-	if not ok and nowSeconds() - link.lastNoteAt > 60 then
-		link.lastNoteAt = nowSeconds()
+	local ok, status = httpSend(publishUrl, "POST", encodeMessage(kind, cycle, event, payload))
+	if not ok and now() - sync.lastNoteAt > 60 then
+		sync.lastNoteAt = now()
 		print("[Trade] the relay did not take a message (" .. tostring(status) .. ") - the trade keeps its own clock")
 	end
 	return ok
 end
 
--- The call sites below name who a message is for. The channel is already this
--- server only, so the name is not needed on the wire - it stays in the log.
+-- Call sites below address the host by name. The channel is already this
+-- server only, so the name stays in the log and off the wire.
+local function publish(event, cycle, payload)
+	return publishMessage("trade", cycle, event, payload)
+end
+
 local function publishSync(event, toUsername, cycle, payload)
 	return publishMessage("trade", cycle, event, payload)
 end
 
 local function notePeer(entry)
-	local first = not link.connected
-	link.peerUsername = entry.username
-	link.peerDisplay = entry.display ~= "" and entry.display or entry.username
+	local first = not sync.connected
+	sync.peerUsername = entry.username
+	sync.peerDisplay = entry.display ~= "" and entry.display or entry.username
+	-- The link is also how this side learns who to listen to when the Players
+	-- list had not been read yet.
+	if hostUsername == "" and entry.username ~= myUsername then
+		hostUsername = entry.username
+		hostDisplay = sync.peerDisplay
+	end
 	if first then
-		link.connected = true
-		link.connectedAt = nowSeconds()
+		sync.connected = true
+		sync.connectedAt = now()
 		print(string.format(
-			"[Trade] CONNECTED to %s (@%s) over the link - both scripts are in this server",
-			link.peerDisplay,
-			link.peerUsername
+			"[Trade] CONNECTED to %s (@%s) over the link - the host's script is running in this server",
+			sync.peerDisplay,
+			sync.peerUsername
 		))
-		if setStatus ~= nil and THEME ~= nil then
-			setStatus("CONNECTED to " .. link.peerDisplay .. " - starting the trade", THEME.green)
-		end
 	end
 	return first
 end
 
 -- One read: only the messages that arrived after the last id we saw.
-local function pollLink()
-	if link.polling then
+local function pollSync(myJobAtStart)
+	if sync.polling then
 		return false
 	end
-	link.polling = true
-	local ok, status, body = http(pollUrlBase .. link.cursor, "GET")
-	link.polling = false
+	sync.polling = true
+	local ok, status, body = httpSend(pollUrlBase .. sync.cursor, "GET")
+	sync.polling = false
 
 	if not ok then
-		link.trouble = link.trouble + 1
-		link.lastError = status
-		if nowSeconds() - link.lastNoteAt > 60 then
-			link.lastNoteAt = nowSeconds()
+		sync.trouble = sync.trouble + 1
+		sync.lastError = status
+		if now() - sync.lastNoteAt > 60 then
+			sync.lastNoteAt = now()
 			if status == 429 then
 				print("[Trade] the relay asked us to slow down - the trade keeps its own clock, nothing is blocked")
 			else
@@ -608,20 +541,20 @@ local function pollLink()
 		return false
 	end
 
-	link.trouble = 0
-	link.lastError = nil
-	link.answered = true
+	sync.trouble = 0
+	sync.lastError = nil
+	sync.answered = true
 
 	for line in tostring(body):gmatch("[^\r\n]+") do
 		if jsonString(line, "event") == "message" then
 			local id = jsonString(line, "id")
 			if id ~= nil then
-				link.cursor = id
+				sync.cursor = id
 			end
 			local payload = jsonString(line, "message")
 			if payload ~= nil then
 				local entry = decodeMessage(payload)
-				if entry ~= nil and entry.from ~= clientId and entry.username:lower() ~= myName:lower() then
+				if entry ~= nil and entry.from ~= clientId and entry.username:lower() ~= myUsername:lower() then
 					-- ServerChat's rule: only somebody really standing in this server.
 					local here = nil
 					pcall(function()
@@ -630,18 +563,20 @@ local function pollLink()
 					if here ~= nil then
 						if entry.event == "hello" then
 							notePeer(entry)
-							local at = nowSeconds()
-							if at - link.peerAckedAt >= 20 then
-								link.peerAckedAt = at
+							local at = now()
+							if at - sync.peerAckedAt >= 20 then
+								sync.peerAckedAt = at
 								publishMessage("ack", 0, "ack", "")
 							end
 						elseif entry.event == "ack" then
 							notePeer(entry)
+						elseif entry.event == "done" then
+							finished = true
 						elseif entry.event ~= "" then
-							local current = link.events[entry.event]
+							local current = sync.events[entry.event]
 							if current == nil or entry.cycle > current.cycle
 								or (entry.cycle == current.cycle and entry.stamp >= current.stamp) then
-								link.events[entry.event] = entry
+								sync.events[entry.event] = entry
 							end
 						end
 					end
@@ -656,60 +591,57 @@ end
 -- pause grows while the relay is refusing, so a busy relay is waited out
 -- quietly instead of being hammered.
 local function startRelayLoop()
-	if link.started then
+	if sync.started then
 		return
 	end
-	link.started = true
-	link.startedAt = nowSeconds()
-	spawnThread(function()
-		while state ~= nil and state.running do
-			local at = nowSeconds()
+	sync.started = true
+	sync.startedAt = now()
+	local jobAtStart = myJob
+	spawnFn(function()
+		while not finished do
+			local at = now()
 			local gap = CONFIG.LINK_HELLO_SECONDS
-			if link.connected then
+			if sync.connected then
 				gap = CONFIG.LINK_KEEPALIVE_SECONDS
-			elseif link.lastHelloFailed then
+			elseif sync.lastHelloFailed then
 				-- A hello that was refused is retried quickly: it is the one
 				-- message the handshake needs.
 				gap = CONFIG.LINK_HELLO_RETRY_SECONDS
 			end
-			if at - link.lastHelloAt >= gap then
-				link.lastHelloAt = at
-				link.lastHelloFailed = not publishMessage("hello", 0, "hello", "host")
+			if at - sync.lastHelloAt >= gap then
+				sync.lastHelloAt = at
+				sync.lastHelloFailed = not publishMessage("hello", 0, "hello", "joiner")
 			end
-			pollLink()
-			-- For the first seconds the channel is read every 1.5s, so two copies
-			-- started together say CONNECTED almost at once. After that the normal
-			-- pace applies: the relay allows 60 requests as a burst and then only
-			-- about one every 10 seconds.
+			pollSync(jobAtStart)
+			-- For the first seconds the channel is read every 2s, so two copies
+			-- started together connect almost at once. After that the normal pace
+			-- applies: the relay allows 60 requests as a burst and then only about
+			-- one every 10 seconds.
 			local pause = CONFIG.LINK_POLL_SECONDS
-			if nowSeconds() - link.startedAt < CONFIG.LINK_START_POLL_WINDOW then
+			if now() - sync.startedAt < CONFIG.LINK_START_POLL_WINDOW then
 				pause = CONFIG.LINK_START_POLL_SECONDS
 			end
-			if link.trouble > 0 then
-				pause = math.min(CONFIG.LINK_MAX_POLL_SECONDS, pause * (1 + link.trouble))
+			if sync.trouble > 0 then
+				pause = math.min(CONFIG.LINK_MAX_POLL_SECONDS, pause * (1 + sync.trouble))
 			end
-			waitSeconds(pause)
+			waitFn(pause)
 		end
 	end)
 end
 
--- Trade actions on this client
+--------------------------------------------------------------------------
+-- Accepting the request and the trade
 --------------------------------------------------------------------------
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
 local function tradeGui()
-	local gui = localPlayer:FindFirstChild("PlayerGui")
-	if gui == nil then
+	if playerGui == nil then
+		playerGui = me:FindFirstChild("PlayerGui")
+	end
+	if playerGui == nil then
 		return nil
 	end
-	return gui:FindFirstChild("TradeGUI")
+	return playerGui:FindFirstChild("TradeGUI")
 end
-
--- This is the joiner's accept code, copied over unchanged so both clients
--- press the buttons in exactly the same way. Both signals are tried one at a
--- time and never twice, and the window itself is never touched by either
--- script (no hiding, no disabling, no deleting).
 
 --------------------------------------------------------------------------
 -- Pressing the trade buttons
@@ -721,7 +653,7 @@ end
 -- confirm step used to work only sometimes. So: nothing below hard-indexes a
 -- child that may not exist yet, a signal is only fired when the game really has
 -- something connected to it, and every step is retried until the game shows it
--- took. Same code as the joiner's.
+-- took.
 --------------------------------------------------------------------------
 
 local ACTIONS_PATH = { "Container", "Trade", "Actions" }
@@ -736,12 +668,11 @@ local CONFIRM_PRESS_TRIES = 6
 local CONFIRM_PRESS_WAIT = 0.4
 
 local PRESS_SIGNALS = { "MouseButton1Click", "Activated" }
-local PRESS_CHECK_DELAY = CONFIG.ACCEPT_PRESS_CHECK_SECONDS
 local HAS_GETCONNECTIONS = type(getconnections) == "function"
 local pressCounts = setmetatable({}, { __mode = "k" })
 
-local ACCEPT_PRESS_ATTEMPTS = CONFIG.ACCEPT_PRESS_ATTEMPTS
-local ACCEPT_PRESS_RETRY = CONFIG.ACCEPT_PRESS_RETRY_SECONDS
+local ACCEPT_PRESS_ATTEMPTS = 3
+local ACCEPT_PRESS_RETRY = 1.2
 
 local function describeButton(button)
 	if button == nil then
@@ -794,7 +725,7 @@ local function realClick(button)
 		return false
 	end
 	pcall(move, positionX, positionY)
-	waitSeconds(0.05)
+	waitFn(0.05)
 	pcall(click)
 	return true
 end
@@ -802,7 +733,7 @@ end
 -- Walk a child path without ever hard-indexing a child that is not there yet.
 local function tradePath(root, names, timeout)
 	timeout = timeout or 0
-	local started = nowSeconds()
+	local started = now()
 	local node = root
 	for _, name in ipairs(names) do
 		if node == nil then
@@ -813,7 +744,7 @@ local function tradePath(root, names, timeout)
 			child = node:FindFirstChild(name)
 		end)
 		if child == nil and timeout > 0 then
-			local left = timeout - (nowSeconds() - started)
+			local left = timeout - (now() - started)
 			if left > 0 then
 				pcall(function()
 					child = node:WaitForChild(name, left)
@@ -868,18 +799,19 @@ end
 -- button's handler yet: no error, no click. So wait for a connection first.
 local function fireWhenConnected(signal, timeout)
 	timeout = timeout or 1.5
-	local started = nowSeconds()
+	local started = now()
 	repeat
 		if not HAS_GETCONNECTIONS then
 			-- This executor cannot look, so firing is all that can be done.
-			return fireSignal(signal)
+			local ok = fireSignal(signal)
+			return ok
 		end
 		local ok, connections = pcall(getconnections, signal)
 		if ok and type(connections) == "table" and #connections > 0 then
 			return fireSignal(signal)
 		end
-		waitSeconds(0.05)
-	until nowSeconds() - started > timeout
+		waitFn(0.05)
+	until now() - started > timeout
 	return false
 end
 
@@ -908,7 +840,7 @@ local function pressButton(button, timeout)
 		end)
 		if signal ~= nil and fireWhenConnected(signal, timeout) then
 			fired = fired or name
-			waitSeconds(PRESS_REACT_WAIT)
+			waitFn(PRESS_REACT_WAIT)
 			if tradeGui() == nil then
 				return true, name
 			end
@@ -988,10 +920,120 @@ local function dumpTradeButtons(gui)
 	end
 end
 
+-- How long the request may take to turn into an open trade window.
+local function waitForTradeWindow(seconds)
+	local deadline = now() + seconds
+	while not finished and now() < deadline do
+		-- If the window arrives switched off, switch it on right away: a
+		-- hidden window can never be accepted.
+		if tradeGui() ~= nil then
+			return true
+		end
+		waitFn(0.2)
+	end
+	return tradeGui() ~= nil
+end-- How much is inside the trade window right now. The host's client has no way
+-- to message this client, but the server copies every item the host offers into
+-- this window, so counting elements is a local, instant answer to "have the
+-- items landed yet?" that does not depend on the relay at all.
+local function tradeWindowSize()
+	local gui = tradeGui()
+	if gui == nil then
+		return nil
+	end
+	local ok, count = pcall(function()
+		local total = 0
+		local stack = { gui }
+		while #stack > 0 do
+			local node = table.remove(stack)
+			for _, child in ipairs(node:GetChildren()) do
+				total = total + 1
+				stack[#stack + 1] = child
+			end
+		end
+		return total
+	end)
+	if ok and type(count) == "number" then
+		return count
+	end
+	return nil
+end
+
+-- Waits until the host has finished adding its items and returns the moment the
+-- last one landed. The window growing and then holding still is the signal; the
+-- relay message is only a backup, so this keeps working when it is throttled.
+local ITEM_STABLE_SECONDS = 1.2
+local ITEM_EARLIEST_SECONDS = 3.5
+
+local function waitForHostItems(cycleNumber)
+	local startedAt = now()
+	local lastSize = tradeWindowSize()
+	if lastSize == nil then
+		lastSize = 0
+	end
+	local lastGrewAt = startedAt
+	local grew = false
+
+	while not finished do
+		local elapsed = now() - startedAt
+
+		local entry = sync.events["items"]
+		if entry ~= nil and entry.cycle >= cycleNumber then
+			return "relay", now()
+		end
+
+		local size = tradeWindowSize()
+		if size == nil then
+			return "window closed", now()
+		end
+		if size > lastSize then
+			grew = true
+			lastSize = size
+			lastGrewAt = now()
+		elseif grew
+			and now() - lastGrewAt >= ITEM_STABLE_SECONDS
+			and elapsed >= ITEM_EARLIEST_SECONDS
+		then
+			return "window", lastGrewAt
+		end
+
+		if elapsed >= ITEMS_WAIT then
+			-- Nothing visible arrived, so fall back to the host's schedule: it
+			-- starts adding 2s after this window opened.
+			if grew then
+				return "window", lastGrewAt
+			end
+			return "timer", startedAt + 2
+		end
+		waitFn(0.2)
+	end
+	return "stopped", now()
+end
+
+local function fireAcceptRequest()
+	local ok, remote = pcall(function()
+		local container = ReplicatedStorage:WaitForChild("Trade", 10)
+		if container == nil then
+			return nil
+		end
+		return container:WaitForChild("AcceptRequest", 10)
+	end)
+	if not ok or remote == nil then
+		print("[Trade] could not find Trade.AcceptRequest")
+		return false
+	end
+	pcall(function()
+		remote:FireServer()
+	end)
+	print("[Trade] accepted the trade request")
+	return true
+end
+
+
 -- Presses accept and keeps pressing until the game shows it took it. The
 -- confirm page appearing, the accept button changing, or the window closing are
--- the proof; a signal call on its own proves nothing. Same code as the joiner's.
-local function pressAccept()
+-- the proof; a signal call on its own proves nothing.
+local function acceptTheTrade()
 	local lastReason = "the trade window is not open"
 	for attempt = 1, ACCEPT_PRESS_ATTEMPTS do
 		local gui = tradeGui()
@@ -1005,7 +1047,7 @@ local function pressAccept()
 			print("[Trade] accept attempt " .. tostring(attempt) .. ": the accept button is not in the window yet")
 		else
 			local before = describeButton(button)
-			local pressed, how = pressButton(button, PRESS_CHECK_DELAY)
+			local pressed, how = pressButton(button, 1.5)
 			if pressed then
 				local name = "?"
 				pcall(function()
@@ -1019,8 +1061,8 @@ local function pressAccept()
 					before
 				))
 
-				local deadline = nowSeconds() + ACCEPT_VERIFY_WAIT
-				while (state == nil or state.running) and nowSeconds() < deadline do
+				local deadline = now() + ACCEPT_VERIFY_WAIT
+				while not finished and now() < deadline do
 					local live = tradeGui()
 					if live == nil then
 						print("[Trade] the trade window closed after the accept press")
@@ -1030,7 +1072,7 @@ local function pressAccept()
 						print("[Trade] the game took the accept - the confirm page is up")
 						return true, "confirm page"
 					end
-					waitSeconds(0.05)
+					waitFn(0.05)
 				end
 
 				-- Second look at the accept button itself: some trade UIs show
@@ -1053,7 +1095,7 @@ local function pressAccept()
 		end
 
 		if attempt < ACCEPT_PRESS_ATTEMPTS then
-			waitSeconds(ACCEPT_PRESS_RETRY)
+			waitFn(ACCEPT_PRESS_RETRY)
 		end
 	end
 	return false, lastReason
@@ -1069,8 +1111,8 @@ local function pressConfirm()
 			return true, "window closed"
 		end
 
-		local deadline = nowSeconds() + (attempt == 1 and CONFIRM_PAGE_WAIT or 1)
-		local nudgedAt = nowSeconds()
+		local deadline = now() + (attempt == 1 and CONFIRM_PAGE_WAIT or 1)
+		local nudgedAt = now()
 		local confirm = findConfirm(gui)
 		while confirm == nil or not isShown(confirm) do
 			local live = tradeGui()
@@ -1079,18 +1121,18 @@ local function pressConfirm()
 				return true, "window closed"
 			end
 			gui = live
-			if nowSeconds() >= deadline then
+			if now() >= deadline then
 				break
 			end
-			if nowSeconds() - nudgedAt >= CONFIRM_NUDGE_SECONDS then
-				nudgedAt = nowSeconds()
+			if now() - nudgedAt >= CONFIRM_NUDGE_SECONDS then
+				nudgedAt = now()
 				local accept = tradePath(gui, ACCEPT_PATH, 0)
 				if accept ~= nil then
 					print("[Trade] the confirm page has not appeared - pressing accept again")
 					pressButton(accept, 1)
 				end
 			end
-			waitSeconds(0.05)
+			waitFn(0.05)
 			confirm = findConfirm(gui)
 		end
 
@@ -1107,9 +1149,9 @@ local function pressConfirm()
 			print("[Trade] the confirm button could not be pressed (" .. tostring(how) .. ")")
 		end
 
-		local settle = nowSeconds() + CONFIRM_PRESS_WAIT
-		while nowSeconds() < settle do
-			waitSeconds(0.05)
+		local settle = now() + CONFIRM_PRESS_WAIT
+		while now() < settle do
+			waitFn(0.05)
 		end
 		local live = tradeGui()
 		if live == nil then
@@ -1129,1436 +1171,695 @@ local function pressConfirm()
 	return false, "still open"
 end
 
-local function tradeRemote(name)
-	local ok, remote = pcall(function()
-		local container = ReplicatedStorage:WaitForChild("Trade", 10)
-		if container == nil then
-			return nil
-		end
-		return container:WaitForChild(name, 10)
+-- The request is visible in this client's own UI, which is what makes cycle 2,
+-- 3, 4... work: the popup (or the trade window itself) is the signal, and the
+-- relay is only a second opinion. The element used to live at
+-- MainGUI.Game.Leaderboard.Container.TradeRequest, but that path belongs to the
+-- game, so the whole PlayerGui is searched for the element by name.
+
+local deepSearchAt = 0
+
+local function requestIndicatorVisible()
+	if playerGui == nil then
+		playerGui = me:FindFirstChild("PlayerGui")
+	end
+	if playerGui == nil then
+		return false
+	end
+
+	-- The cheap check first: the path the game has always used for the popup.
+	local ok, found = pcall(function()
+		local mainGUI = playerGui:FindFirstChild("MainGUI")
+		local gameNode = mainGUI and mainGUI:FindFirstChild("Game")
+		local board = gameNode and gameNode:FindFirstChild("Leaderboard")
+		local container = board and board:FindFirstChild("Container")
+		return container ~= nil and container:FindFirstChild("TradeRequest") ~= nil
 	end)
-	if ok then
-		return remote
+	if ok and found then
+		return true
+	end
+
+	-- Then a bounded search of the whole PlayerGui, once a second: the popup
+	-- moving somewhere else in the game's UI still gets found, without walking
+	-- the whole tree five times a second.
+	if now() - deepSearchAt < 1 then
+		return false
+	end
+	deepSearchAt = now()
+
+	local deep, deepFound = pcall(function()
+		local stack = { playerGui }
+		local seen = 0
+		while #stack > 0 and seen < 600 do
+			local node = table.remove(stack)
+			seen = seen + 1
+			for _, child in ipairs(node:GetChildren()) do
+				if child.Name == "TradeRequest" then
+					return true
+				end
+				stack[#stack + 1] = child
+			end
+		end
+		return false
+	end)
+	return deep and deepFound == true
+end
+
+-- A request that never turned into a trade window (it expired, or the accept
+-- did not reach the game) gets a local retry, then this cycle is handed back
+-- to the host, which sends the same request again.
+local REQUEST_RETRY_SECONDS = 3
+local REQUEST_RETRY_WAIT = 3
+
+-- Every relay request is used once, keyed by the message itself, so a request
+-- the host sends again counts as new while an old message is never replayed.
+local lastReqKey = nil
+
+-- The host is told once per request that the window never opened, so a slow
+-- relay is not spent on repeats.
+local nowindowTold = nil
+
+local function tellNowindow(cycleNumber)
+	local attempt = tostring(cycleNumber) .. ":" .. tostring(lastReqKey)
+	if nowindowTold == attempt then
+		return
+	end
+	nowindowTold = attempt
+	publish("reqok", cycleNumber, "nowindow")
+end
+
+-- How long the host may be missing from the server before this session stops
+-- waiting for it.
+local HOST_GONE_SECONDS = 30
+
+local function hostInServer()
+	local ok, player = pcall(function()
+		return Players:FindFirstChild(hostUsername)
+	end)
+	return ok and player ~= nil
+end
+
+-- Waits for the next request. The order of preference is what makes cycles
+-- chain quickly: an open trade window first, then the request popup, then the
+-- host's message. The one thing that ends the wait is the host leaving.
+-- Filled in once the card exists. Declared here so the wait below can report
+-- on it; the card functions themselves are defined further down.
+local cardStatus, cardInfo
+
+-- If the host is still in the server but nothing has happened for this long,
+-- it is almost certainly finished (its own console says so). This side says it
+-- on the card and keeps listening, so a late request is still picked up.
+local IDLE_FINISH_SECONDS = 45
+
+local function waitForRequest(cycle)
+	local lastNoteAt = now()
+	local hostGoneAt = nil
+	local armedAt = 0
+	local idleNoted = false
+	while not finished do
+		if tradeGui() ~= nil then
+			return "window"
+		end
+
+		local entry = sync.events["req"]
+		local relayWanted = entry ~= nil and entry.cycle >= cycle
+		local visible = requestIndicatorVisible()
+
+		if (visible or relayWanted) and now() - armedAt > 1.5 then
+			armedAt = now()
+			if relayWanted then
+				local key = tostring(entry.cycle) .. ":" .. tostring(entry.payload) .. ":" .. tostring(entry.stamp)
+				if key ~= lastReqKey then
+					lastReqKey = key
+					return "relay"
+				end
+			end
+			if visible then
+				return "popup"
+			end
+		end
+
+		if hostInServer() then
+			hostGoneAt = nil
+		elseif hostGoneAt == nil then
+			hostGoneAt = now()
+		elseif now() - hostGoneAt >= HOST_GONE_SECONDS then
+			print("[Trade] the host is no longer in this server - this session is over")
+			finished = true
+			break
+		end
+
+		if not idleNoted and now() - armedAt >= IDLE_FINISH_SECONDS then
+			idleNoted = true
+			print("[Trade] the host has gone quiet - it has most likely finished. Still listening.")
+			if cardStatus ~= nil then
+				cardStatus("The host has gone quiet - it has most likely finished", "green")
+			end
+			if cardInfo ~= nil then
+				cardInfo("Nothing left to trade. Still listening for a request.")
+			end
+		end
+
+		if now() - lastNoteAt >= 20 then
+			print("[Trade] still waiting for the host's trade request (cycle " .. tostring(cycle) .. ")")
+			lastNoteAt = now()
+		end
+		waitFn(0.2)
 	end
 	return nil
 end
 
-local function sendTradeRequest(targetPlayer)
-	local remote = tradeRemote("SendRequest")
-	if remote == nil then
-		return false, "Trade.SendRequest could not be found"
-	end
-	local ok, err = pcall(function()
-		remote:InvokeServer(targetPlayer)
-	end)
-	if not ok then
-		return false, tostring(err)
-	end
-	return true
-end
-
-local function offerItem(itemName)
-	local remote = tradeRemote("OfferItem")
-	if remote == nil then
-		return false
-	end
-	return pcall(function()
-		remote:FireServer(itemName, "Weapons")
-	end)
-end
-
+-- Who the host is
 --------------------------------------------------------------------------
--- Reading the salvage / inventory
+
 --
--- Same tiers and same stack expansion as your trade script, but every weapons
--- tab is discovered rather than listed, item cards are found by their label
--- (the game does not name them the same way in every tab), and the only items
--- left alone are the Default Gun and Default Knife while they sit in Currents.
---------------------------------------------------------------------------
+-- Nothing joins anybody: both people are already in this server. The host is
+-- simply the other player here, so its username - which every message and the
+-- trade itself are addressed to - is read straight from the Players list.
 
-local tradePaths = nil
--- How many items were skipped as "keep" by the last read (Default Gun / Knife).
-local lastKeptCount = 0
--- The names that were left alone by the last read.
-local lastKeptNames = {}
--- Names already explained in the console, so the note is printed once.
-local sharedNoted = {}
-
--- Lowercase, letters and digits only: "Default_Knife_ab12" and "Default Knife"
--- then compare the way a player would read them.
-local function normalizeName(text)
-	local lowered = tostring(text or ""):lower()
-	return (lowered:gsub("[^%w]", ""))
-end
-
-local KEEP_KEYS = {}
-for _, name in ipairs(CONFIG.KEEP_ITEM_NAMES) do
-	KEEP_KEYS[#KEEP_KEYS + 1] = normalizeName(name)
-end
-
--- True when a name is one of the two defaults. `lenient` also accepts a suffix
--- ("Default_Knife_ab12" from the salvage list); the strict form is used for
--- inventory cards, so a skin called "Default Gun Gold" is still traded.
-local function isKeepKey(key, lenient)
-	if key == nil or key == "" then
-		return false
+-- Whoever else is in this server.
+local function otherPlayer()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= me then
+			return player
+		end
 	end
-	for _, keep in ipairs(KEEP_KEYS) do
-		if key == keep then
-			return true
-		end
-		if lenient and #key > #keep and key:sub(1, #keep) == keep then
-			return true
-		end
-		if not lenient and #key > #keep and key:sub(1, #keep) == keep then
-			local rest = key:sub(#keep + 1)
-			if rest:match("^%d+$") then
-				return true
+	return nil
+end
+
+-- CONNECTED to whoever else is here, or waiting for them to show up.
+
+-- Filled in once the card below exists, so the wait can report on it.
+
+-- CONFIG.HOST pins a username; otherwise it is whoever else is here.
+local function findTheHost()
+	local wanted = CONFIG.HOST ~= nil and tostring(CONFIG.HOST) ~= "" and tostring(CONFIG.HOST) or nil
+	local pinned = wanted ~= nil
+	local nextNote = now() + 15
+
+	if pinned then
+		print("[Trade] using the host set in the config: " .. wanted)
+	end
+
+	while not finished do
+		local found = nil
+		if pinned then
+			for _, player in ipairs(Players:GetPlayers()) do
+				if player ~= me and player.Name:lower() == wanted:lower() then
+					found = player
+					break
+				end
 			end
+		else
+			found = otherPlayer()
 		end
+
+		if found ~= nil then
+			hostUsername = tostring(found.Name)
+			hostDisplay = cleanText(tostring(found.DisplayName or found.Name), 40)
+			if pinned then
+				print("[Trade] the host is here: " .. hostDisplay .. " (@" .. hostUsername .. ")")
+			else
+				print("[Trade] the other person in this server, the host, is " .. hostDisplay .. " (@" .. hostUsername .. ")")
+			end
+			return true
+		end
+
+		if now() >= nextNote then
+			print(pinned and "[Trade] waiting for " .. wanted .. " to be in this server (both scripts must be in the SAME server)..." or "[Trade] waiting for the host to be in this server (both scripts must be in the SAME server)...")
+			if cardStatus ~= nil then
+				cardStatus("NOT CONNECTED - nobody else here", "amber")
+				cardInfo("Both scripts must be in the SAME server")
+			end
+			nextNote = now() + 15
+		end
+		waitFn(1)
 	end
 	return false
 end
 
--- The tab an item sits in decides whether the keep rule applies at all: a
--- Default Gun in Events or Classic is still traded away.
-local function tabMatchesKeepTab(tab)
-	if tab == nil then
-		-- Unknown tab: leave the default behind rather than trade it by accident.
-		return true
-	end
-	local name = tostring(tab)
-	if name == CONFIG.KEEP_TAB then
-		return true
-	end
-	return name:sub(1, #CONFIG.KEEP_TAB + 1) == CONFIG.KEEP_TAB .. "/"
-end
-
-local function isKeptItem(data)
-	if data == nil then
-		return false
-	end
-	if not isKeepKey(data.key, false) then
-		return false
-	end
-	return tabMatchesKeepTab(data.tab)
-end
-
--- A child that may not exist, without ever hanging on it.
-local function childOf(parent, name, timeout)
-	if parent == nil then
-		return nil
-	end
-	local ok, found = pcall(function()
-		return parent:FindFirstChild(name) or parent:WaitForChild(name, timeout or 2)
-	end)
-	if ok and typeof(found) == "Instance" then
-		return found
-	end
-	return nil
-end
-
--- The same, but without waiting: used while walking a list that is expected to
--- be there already, where waiting on every label would add up to minutes.
-local function findChild(parent, name)
-	if parent == nil then
-		return nil
-	end
-	local ok, found = pcall(function()
-		return parent:FindFirstChild(name)
-	end)
-	if ok and typeof(found) == "Instance" then
-		return found
-	end
-	return nil
-end
-
-local function tradeRoots()
-	local ok, roots = pcall(function()
-		local gui = childOf(localPlayer, "PlayerGui", 10)
-		local main = childOf(gui, "MainGUI", 20)
-		local gameGui = childOf(main, "Game", 20)
-		return gameGui
-	end)
-	if ok and typeof(roots) == "Instance" then
-		return roots
-	end
-	return nil
-end
-
--- Every weapons tab under Items.Container, whatever it is called. Current and
--- Classic are found this way, and so is the Events group (Holiday ->
--- Halloween, Christmas, ...): a tab the script has never heard of is still read
--- and its items still traded.
-local function collectTabs(parent, prefix, list, depth)
-	if parent == nil or depth > 3 then
-		return
-	end
-	local ok, children = pcall(function()
-		return parent:GetChildren()
-	end)
-	if not ok or children == nil then
-		return
-	end
-	for _, node in ipairs(children) do
-		if node ~= nil and typeof(node) == "Instance" then
-			-- Item cards also have a Container child (the stack amount), so they
-			-- are told apart by the ItemName label that only cards carry.
-			if findChild(node, "ItemName") == nil then
-				local tabName = prefix ~= "" and (prefix .. "/" .. tostring(node.Name)) or tostring(node.Name)
-				local container = findChild(node, "Container")
-				if container ~= nil then
-					list[#list + 1] = { tab = tabName, node = container }
-				end
-				collectTabs(node, tabName, list, depth + 1)
-			end
-		end
-	end
-end
-
-local function salvageContainer(gameGui)
-	local crafting = childOf(gameGui, "Crafting", 15)
-	local inventory = childOf(crafting, "Inventory", 10) or crafting
-	local salvage = childOf(inventory, "Salvage", 10)
-	if salvage == nil then
-		local ok, found = pcall(function()
-			return gameGui:FindFirstChild("Salvage", true)
-		end)
-		if ok and typeof(found) == "Instance" then
-			salvage = found
-		end
-	end
-	if salvage == nil then
-		return nil
-	end
-	local scroll = childOf(salvage, "ScrollFrame", 3)
-	local container = childOf(scroll or salvage, "Container", 3)
-	return container or scroll or salvage
-end
-
--- The three nodes every read needs: the Game gui, the tab holder and the
--- salvage list. Cached, and re-found when a node the game rebuilt goes away.
-local function resolveTradePaths()
-	if tradePaths ~= nil then
-		local alive = false
-		pcall(function()
-			alive = tradePaths.game.Parent ~= nil
-				and tradePaths.tabHolder.Parent ~= nil
-				and tradePaths.salvage.Parent ~= nil
-		end)
-		if alive then
-			return tradePaths
-		end
-		tradePaths = nil
-	end
-
-	local gameGui = tradeRoots()
-	if gameGui == nil then
-		return nil
-	end
-	local inventoryGui = childOf(gameGui, "Inventory", 15)
-	local main = inventoryGui and childOf(inventoryGui, "Main", 10)
-	local weapons = main and childOf(main, "Weapons", 10)
-	local itemsNode = weapons and childOf(weapons, "Items", 10)
-	local tabHolder = itemsNode and childOf(itemsNode, "Container", 10)
-	if tabHolder == nil then
-		return nil
-	end
-	local salvage = salvageContainer(gameGui)
-	if salvage == nil then
-		return nil
-	end
-
-	tradePaths = { game = gameGui, tabHolder = tabHolder, salvage = salvage }
-	return tradePaths
-end
-
--- The longest inventory name that fits a salvage frame name. The old version
--- compared first words, which made every "Default_*" frame match "Default Gun";
--- the longest fit cannot do that, so similarly named items keep their own tab.
-local function matchItem(frameName, index, cards)
-	local key = normalizeName(frameName)
-	if key == "" then
-		return nil
-	end
-	local exact = index[key]
-	if exact ~= nil then
-		return exact
-	end
-	local best, bestLen = nil, 0
-	for _, data in ipairs(cards) do
-		local candidate = data.key
-		if #candidate >= 4 then
-			if key:sub(1, #candidate) == candidate then
-				if #candidate > bestLen then
-					best, bestLen = data, #candidate
-				end
-			elseif #key >= 4 and candidate:sub(1, #key) == key and #key > bestLen then
-				best, bestLen = data, #key
-			end
-		end
-	end
-	return best
-end
-
-local function shuffleTable(list)
-	for i = #list, 2, -1 do
-		local j = math.random(i)
-		list[i], list[j] = list[j], list[i]
-	end
-end
-
-pcall(function()
-	math.randomseed(tick())
-end)
-
-local function getFreshWeaponQueue()
-	local paths = resolveTradePaths()
-	if paths == nil then
-		return nil, nil
-	end
-
-	local tabs = {}
-	collectTabs(paths.tabHolder, "", tabs, 0)
-
-	local cards = {}
-	local index = {}
-	local shared = {}
-
-	for _, tab in ipairs(tabs) do
-		local ok, children = pcall(function()
-			return tab.node:GetChildren()
-		end)
-		if ok and children ~= nil then
-			for _, card in ipairs(children) do
-				-- Cards are found by their label, not by name: the game does not
-				-- use the same name for every card in every tab.
-				local itemName = findChild(card, "ItemName")
-				local label = itemName and findChild(itemName, "Label")
-				if label ~= nil and label:IsA("TextLabel") then
-					local text = tostring(label.Text)
-					local key = normalizeName(text)
-					if key ~= "" then
-						local amount = 1
-						local cardContainer = findChild(card, "Container")
-						local amountObject = cardContainer and findChild(cardContainer, "Amount")
-						if amountObject ~= nil then
-							local digits = tostring(amountObject.Text or ""):match("%d+")
-							amount = tonumber(digits) or 1
-						end
-						local data = {
-							label = text,
-							key = key,
-							tab = tab.tab,
-							amount = math.max(1, amount),
-						}
-						pcall(function()
-							data.color = itemName.BackgroundColor3
-						end)
-						cards[#cards + 1] = data
-						local existing = index[key]
-						if existing == nil then
-							index[key] = data
-						else
-							shared[key] = true
-							-- The Currents entry wins, because that is the tab the
-							-- Default Gun and Default Knife live in.
-							if existing.tab ~= CONFIG.KEEP_TAB and tab.tab == CONFIG.KEEP_TAB then
-								index[key] = data
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-
-	-- Said once, not on every read: the same note twenty times helps nobody.
-	for key in pairs(shared) do
-		if isKeepKey(key, false) and not sharedNoted[key] then
-			sharedNoted[key] = true
-			local label = index[key] and index[key].label or key
-			print("[Trade] note: '" .. tostring(label) .. "' also exists in another tab; treating it as the Currents one")
-		end
-	end
-
-	local okSalvage, salvageChildren = pcall(function()
-		return paths.salvage:GetChildren()
-	end)
-	if not okSalvage or salvageChildren == nil then
-		return nil, nil
-	end
-
-	local tier1, tier2, tier3 = {}, {}, {} -- 1: RGB(100,10,255)  2: RGB(255,0,179)  3: the rest
-	local kept, keptNames = 0, {}
-	local matched = {}
-
-	for _, frame in ipairs(salvageChildren) do
-		local frameName = tostring(frame.Name)
-		local data = matchItem(frameName, index, cards)
-		if data ~= nil then
-			matched[data.key] = true
-		end
-
-		-- Kept: the Default Gun and Default Knife, in Currents. A frame the tabs
-		-- do not explain falls back to its own name, so a default that is not in
-		-- any tab is still never offered.
-		if isKeptItem(data) or (data == nil and isKeepKey(normalizeName(frameName), true)) then
-			kept = kept + (data and data.amount or 1)
-			keptNames[data and data.label or frameName] = true
-		else
-			local entry = { frameName = frameName, amount = data and data.amount or 1 }
-			local tier = tier3
-			if data ~= nil and data.color ~= nil then
-				local r = math.floor(data.color.R * 255 + 0.5)
-				local g = math.floor(data.color.G * 255 + 0.5)
-				local b = math.floor(data.color.B * 255 + 0.5)
-				if r == 100 and g == 10 and b == 255 then
-					tier = tier1
-				elseif r == 255 and g == 0 and b == 179 then
-					tier = tier2
-				end
-			end
-			tier[#tier + 1] = entry
-		end
-	end
-
-	shuffleTable(tier1)
-	shuffleTable(tier2)
-	shuffleTable(tier3)
-
-	local queue = {}
-	for _, tier in ipairs({ tier1, tier2, tier3 }) do
-		for _, item in ipairs(tier) do
-			for _ = 1, item.amount do
-				queue[#queue + 1] = item.frameName
-			end
-		end
-	end
-
-	-- Cards the salvage list did not show. Reported rather than traded: the
-	-- trade takes the salvaged name, and offering a name the trade does not know
-	-- would only waste a slot.
-	local unlisted, unlistedNames = 0, {}
-	for _, data in ipairs(cards) do
-		if not matched[data.key] and not isKeptItem(data) and unlistedNames[data.label] == nil then
-			unlistedNames[data.label] = true
-			unlisted = unlisted + 1
-		end
-	end
-
-	lastKeptCount = kept
-	lastKeptNames = keptNames
-	return queue, {
-		salvage = #salvageChildren,
-		tradable = #queue,
-		kept = kept,
-		unlisted = unlisted,
-		unlistedNames = unlistedNames,
-		tabs = #tabs,
-	}
-end
-
-local function keptNamesText(limit)
-	local names = {}
-	for name in pairs(lastKeptNames) do
-		names[#names + 1] = tostring(name)
-		if #names >= (limit or 6) then
-			break
-		end
-	end
-	if #names == 0 then
-		return "none found"
-	end
-	return table.concat(names, ", ")
-end
-
--- An empty salvage read is not proof that the run is over: the game rebuilds
--- that list, and a read can land while it is still filling in, which used to
--- end a run with items still in the inventory. This keeps reading until the
--- answer holds still:
---   * a tradable item shows up            -> not over, hand it back
---   * the tabs are readable and nothing
---     in them or in the salvage is
---     tradable, read the same way a few
---     times in a row                      -> confirmed finished
---   * the list keeps coming back with
---     nothing in it, or the tabs still
---     show items the salvage never lists  -> not confirmed; reported, never
---                                            claimed as "all traded".
-local function waitForFinished()
-	local lastInfo = nil
-	local confirms = 0
-	local empties = 0
-	while state.running do
-		local queue, info = getFreshWeaponQueue()
-		if queue == nil then
-			empties = empties + 1
-			if empties > CONFIG.EMPTY_READ_ATTEMPTS then
-				return nil, lastInfo, false
-			end
-			print("[Trade] the inventory could not be read - reading again")
-			waitSeconds(CONFIG.EMPTY_READ_GAP_SECONDS)
-		elseif #queue > 0 then
-			return queue, info, false
-		else
-			lastInfo = info
-			if info ~= nil and info.tabs > 0 and info.unlisted == 0 then
-				confirms = confirms + 1
-				if confirms >= CONFIG.DONE_CONFIRM_ATTEMPTS then
-					return nil, info, true
-				end
-				waitSeconds(CONFIG.DONE_CONFIRM_GAP_SECONDS)
-			else
-				empties = empties + 1
-				if empties > CONFIG.EMPTY_READ_ATTEMPTS then
-					return nil, info, false
-				end
-				waitSeconds(CONFIG.EMPTY_READ_GAP_SECONDS)
-			end
-		end
-	end
-	return nil, lastInfo, false
-end
-
 --------------------------------------------------------------------------
--- The coordinated trade loop
---
---   request out (and told to the joiner) -> 1s -> joiner accepts (and says so)
---   -> 2s -> add up to 4 items (and told to the joiner) -> 6s -> this side
---   presses accept and says "accepting now", the joiner presses 1s later ->
---   both confirm 1s after their own accept -> 3s -> next request. It repeats
---   until nothing tradable is left (the Default Gun and Default Knife in
---   Currents are never offered).
+-- The card: what this side is connected to and doing right now
 --------------------------------------------------------------------------
 
--- Asks for a trade and keeps trying while the game refuses. A request is
--- refused while another trade is still open and for a moment after one, which
--- used to end the whole loop on the second cycle.
-local function requestTrade(targetPlayer, targetUsername, cycle)
-	local lastError = nil
-	for attempt = 1, CONFIG.REQUEST_ATTEMPTS do
-		if not state.running then
-			return false, "stopped"
-		end
-		if targetPlayer == nil or targetPlayer.Parent == nil then
-			return false, targetUsername .. " left the server"
-		end
-
-		local ok, err = sendTradeRequest(targetPlayer)
-		if ok then
-			-- Tell the joiner the request is on its way, so it can accept it one
-			-- second from now instead of guessing when to press.
-			publishSync("req", targetUsername, cycle, tostring(attempt))
-			print(string.format("[Trade] request sent to %s (attempt %d)", targetUsername, attempt))
-			print("[Trade] told " .. targetUsername .. ": the request is out - accept it now")
-			setStatus(string.format(
-				"Cycle %d: request sent to %s - told it to accept",
-				cycle,
-				targetUsername
-			), THEME.green)
-			return true
-		end
-
-		lastError = err
-		print(string.format("[Trade] request attempt %d failed: %s", attempt, tostring(err)))
-		setStatus(string.format(
-			"Cycle %d: the request was refused (%s). Retrying in %ds...",
-			cycle,
-			tostring(err),
-			CONFIG.REQUEST_RETRY_SECONDS
-		), THEME.amber)
-		waitSeconds(CONFIG.REQUEST_RETRY_SECONDS)
-	end
-	return false, lastError
-end
-
--- The game refuses a new request while a trade window is still up, so the next
--- request waits for this client's window to go away first. The cap keeps a game
--- that leaves the window instance in place from stalling the loop.
-local function waitForTradeClosed(seconds)
-	local deadline = nowSeconds() + seconds
-	while state ~= nil and state.running and nowSeconds() < deadline do
-		if tradeGui() == nil then
-			return true
-		end
-		waitSeconds(0.25)
-	end
-	return tradeGui() == nil
-end
-
-local function countStillInQueue(batch, queue)
-	local present = {}
-	for _, name in ipairs(queue or {}) do
-		local key = tostring(name):lower()
-		present[key] = (present[key] or 0) + 1
-	end
-	local left = 0
-	for _, name in ipairs(batch) do
-		local key = tostring(name):lower()
-		if (present[key] or 0) > 0 then
-			present[key] = present[key] - 1
-			left = left + 1
-		end
-	end
-	return left
-end
-
-local function runTradeLoop(targetPlayer, targetUsername)
-	if resolveTradePaths() == nil then
-		error("the inventory and salvage containers could not be found")
-	end
-
-	local cycle = 0
-	local traded = 0
-	local emptyCycles = 0
-
-	startRelayLoop()
-
-	-- One full round trip. "ok" means the items left the inventory, "retry"
-	-- means this trade did not happen at all, "stop" means the script is done.
-	local function runCycle(batch)
-		setStatus(string.format("Cycle %d: sending %s a trade request...", cycle, targetUsername), THEME.green)
-		updateInfo()
-
-		-- The acceptance this cycle needs must be NEW: the previous cycle's
-		-- "reqok" is still sitting in the link and would otherwise read as an
-		-- acceptance of a request that has not gone out yet.
-		local reqokBefore = link.events["reqok"]
-
-		-- A window left over from the previous cycle would look like "the joiner
-		-- accepted" the moment the request goes out, so let it go first.
-		if tradeGui() ~= nil then
-			waitForTradeClosed(CONFIG.TRADE_CLOSE_SECONDS)
-		end
-
-		local requested, requestError = requestTrade(targetPlayer, targetUsername, cycle)
-		if not requested then
-			if tostring(requestError) == "stopped" then
-				return "stop"
-			end
-			setStatus(
-				string.format("Cycle %d: the trade request could not be sent (%s).", cycle, tostring(requestError)),
-				THEME.red
-			)
-			return "retry"
-		end
-
-		-- The timings below count from the request that actually went through,
-		-- not from a refused attempt before it.
-		local cycleStartedAt = nowSeconds()
-
-		-- Step 2: the joiner accepting. There are two proofs and whichever comes
-		-- first wins - its own "reqok" message, or this client's trade window,
-		-- which the server only opens for a request that was accepted. The window
-		-- is local and instant, so a lost message can never stall the cycle.
-		local acceptedAt = nil
-		local acceptedBy = nil
-		setStatus(string.format("Cycle %d: waiting for %s to accept the request", cycle, targetUsername), THEME.amber)
-		local deadline = nowSeconds() + CONFIG.REQUEST_ACK_SECONDS
-		while state.running and nowSeconds() < deadline do
-			if tradeGui() ~= nil then
-				acceptedAt = nowSeconds()
-				acceptedBy = "the trade window opened"
-				break
-			end
-			local entry = link.events["reqok"]
-			if entry ~= nil
-				and entry ~= reqokBefore
-				and entry.cycle >= cycle
-				and tostring(entry.payload) ~= "nowindow"
-			then
-				-- It says it accepted. The window may still be a moment away, and
-				-- items offered before it exists would go into nothing.
-				print(string.format("[Trade] %s says it accepted the request", targetUsername))
-				local grace = nowSeconds() + CONFIG.ACCEPT_WINDOW_GRACE_SECONDS
-				while state.running and nowSeconds() < grace and tradeGui() == nil do
-					waitSeconds(0.1)
-				end
-				acceptedAt = nowSeconds()
-				acceptedBy = tradeGui() ~= nil and "it said so, and the window is open" or "it said so"
-				break
-			end
-			waitSeconds(0.2)
-		end
-
-		if acceptedAt == nil then
-			print("[Trade] the trade window never opened after the request - sending the request again")
-			setStatus(
-				string.format("Cycle %d: the trade window did not open - asking %s again...", cycle, targetUsername),
-				THEME.amber
-			)
-			return "retry"
-		end
-		print(string.format(
-			"[Trade] request -> accepted in %.1fs (%s); adding the items in %ss",
-			acceptedAt - cycleStartedAt,
-			tostring(acceptedBy),
-			tostring(CONFIG.REQUEST_SETTLE_SECONDS)
-		))
-		if not state.running then
-			return "stop"
-		end
-
-		-- The joiner accepted, so the window is live on both clients. The items go
-		-- in REQUEST_SETTLE_SECONDS after that, not after the request itself.
-		setStatus(string.format(
-			"Cycle %d: %s accepted - adding %d item(s) in %ds",
-			cycle,
-			targetUsername,
-			#batch,
-			math.ceil(CONFIG.REQUEST_SETTLE_SECONDS)
-		), THEME.green)
-		waitSeconds(CONFIG.REQUEST_SETTLE_SECONDS)
-
-		setStatus(string.format("Cycle %d: adding %d item(s)...", cycle, #batch), THEME.green)
-
-		-- The trade window is left alone here: it stays visible and enabled the
-		-- whole time, on both clients.
-		for _, itemName in ipairs(batch) do
-			offerItem(itemName)
-			print("[Trade] offered " .. tostring(itemName))
-			waitSeconds(CONFIG.ITEM_OFFER_GAP_SECONDS)
-		end
-
-		local lastItemAt = nowSeconds()
-		-- Told, never waited on: it is the joiner's backup clock for the case
-		-- where its own window does not show the items.
-		publishSync("items", targetUsername, cycle, tostring(#batch))
-		setStatus(string.format(
-			"Cycle %d: %d item(s) added - both sides accept in %ds",
-			cycle,
-			#batch,
-			math.ceil(CONFIG.ACCEPT_DELAY_SECONDS)
-		), THEME.green)
-		print(string.format(
-			"[Trade] all %d item(s) added - this side accepts in %ss, then %s accepts %ss later",
-			#batch,
-			tostring(CONFIG.ACCEPT_DELAY_SECONDS),
-			targetUsername,
-			tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS)
-		))
-
-		local acceptAt = lastItemAt + CONFIG.ACCEPT_DELAY_SECONDS
-		while state.running do
-			local left = acceptAt - nowSeconds()
-			if left <= 0 then
-				break
-			end
-			setStatus(string.format("Cycle %d: accepting in %ss...", cycle, tostring(math.ceil(left))), THEME.green)
-			waitSeconds(math.min(1, left))
-		end
-		if not state.running then
-			return "stop"
-		end
-
-		-- Told as it happens, so the console on both sides shows the same order.
-		setStatus(string.format("Cycle %d: pressing accept now...", cycle), THEME.green)
-		publishSync("acceptgo", targetUsername, cycle, "now")
-		print("[Trade] told " .. targetUsername .. ": accepting now - press accept in " .. tostring(CONFIG.JOINER_ACCEPT_DELAY_SECONDS) .. "s")
-
-		local accepted, acceptErr = pressAccept()
-		if not accepted then
-			-- This side never reached the accepted state, so there is nothing to
-			-- confirm. Handing the cycle back is what stops a half-agreed trade.
-			print("[Trade] this side did not accept the items (" .. tostring(acceptErr) .. ") - not confirming")
-			publishSync("hostaccept", targetUsername, cycle, "notaccepted")
-			return "retry"
-		end
-		publishSync("hostaccept", targetUsername, cycle, "ok")
-		print("[Trade] this side accepted the items")
-		setStatus(string.format(
-			"Cycle %d: this side accepted - confirming in %ds",
-			cycle,
-			math.ceil(CONFIG.CONFIRM_DELAY_SECONDS)
-		), THEME.green)
-
-		-- The joiner was told the same moment and presses accept one second after
-		-- this side, then confirms a second after that. Confirming on the clock
-		-- keeps the two sides together without a round trip; a trade only runs
-		-- when BOTH sides confirm, so an early confirm here cannot move anything
-		-- on its own.
-		waitSeconds(CONFIG.CONFIRM_DELAY_SECONDS)
-		local confirmed, confirmErr = pressConfirm()
-		if not confirmed then
-			print("[Trade] could not press confirm: " .. tostring(confirmErr))
-		end
-		setStatus(string.format("Cycle %d: confirmed - waiting for the trade to close", cycle), THEME.green)
-
-		-- If the window is still up a few seconds later, the joiner's own confirm
-		-- had not landed yet: press once more rather than leaving it hanging.
-		local recheck = nowSeconds() + 4
-		while state.running and nowSeconds() < recheck and tradeGui() ~= nil do
-			waitSeconds(0.25)
-		end
-		if tradeGui() ~= nil then
-			print("[Trade] the trade window is still open - pressing confirm once more")
-			pressConfirm()
-		end
-
-		-- The next request cannot go out while this window is still up.
-		waitForTradeClosed(CONFIG.TRADE_CLOSE_SECONDS)
-		waitSeconds(CONFIG.TRADE_SETTLE_SECONDS)
-
-		local after = getFreshWeaponQueue()
-		local left = #batch
-		if after ~= nil then
-			left = countStillInQueue(batch, after)
-		end
-		local moved = #batch - left
-
-		if moved <= 0 then
-			emptyCycles = emptyCycles + 1
-			print(string.format(
-				"[Trade] cycle %d traded nothing: all %d item(s) are still in the salvage",
-				cycle,
-				#batch
-			))
-			return "retry"
-		end
-
-		emptyCycles = 0
-		traded = traded + moved
-		print(string.format(
-			"=== Trade cycle %d complete: %d item(s) traded, %d in total ===",
-			cycle,
-			moved,
-			traded
-		))
-		setStatus(string.format(
-			"Cycle %d complete: %d traded. Next trade in %ds...",
-			cycle,
-			moved,
-			math.ceil(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
-		), THEME.green)
-		return "ok"
-	end
-
-
-	while state.running do
-		local queue, info = getFreshWeaponQueue()
-		if queue == nil then
-			error("the inventory could not be read")
-		end
-
-		if #queue == 0 then
-			-- One empty read is not proof: the salvage list is rebuilt by the game
-			-- and used to come back empty while items were still there.
-			print("[Trade] nothing tradable in that read - double checking before stopping")
-			local again, againInfo, confirmed = waitForFinished()
-			if not state.running then
-				break
-			end
-			if againInfo ~= nil then
-				-- What the last read saw, including anything it could not offer.
-				info = againInfo
-			end
-			if again ~= nil and #again > 0 then
-				queue, info = again, againInfo
-				print("[Trade] good thing I checked: " .. tostring(#again) .. " item(s) are still tradable")
-			elseif confirmed then
-				print(string.format(
-					"[Trade] nothing tradable left - read the salvage and every tab again %d times and only the kept item(s) remain (%s).",
-					CONFIG.DONE_CONFIRM_ATTEMPTS,
-					keptNamesText()
-				))
-				break
-			else
-				print("[Trade] STOPPED WITHOUT CONFIRMING: the tabs and the salvage kept disagreeing.")
-				if info ~= nil and info.unlistedNames ~= nil then
-					local names = {}
-					for name in pairs(info.unlistedNames) do
-						names[#names + 1] = tostring(name)
-						if #names >= 8 then
-							break
-						end
-					end
-					if #names > 0 then
-						print("[Trade] still in the inventory but not in the salvage list: " .. table.concat(names, ", "))
-					end
-				end
-				print("[Trade] " .. tostring(lastKeptCount) .. " kept item(s): " .. keptNamesText())
-				break
-			end
-		end
-
-		local remaining = #queue
-		cycle = cycle + 1
-
-		local batch = {}
-		for i = 1, math.min(CONFIG.MAX_ITEMS_PER_TRADE, remaining) do
-			batch[#batch + 1] = queue[i]
-		end
-
-		print(string.format(
-			"=== Trade cycle %d: %d item(s) this trade, %d tradable left (%d kept back) ===",
-			cycle,
-			#batch,
-			remaining,
-			lastKeptCount
-		))
-
-		local outcome = runCycle(batch)
-
-		if outcome == "stop" then
-			break
-		elseif outcome == "retry" then
-			cycle = cycle - 1
-			if emptyCycles >= CONFIG.MAX_EMPTY_CYCLES then
-				error(string.format(
-					"the last %d trades moved nothing - the items are not reaching the trade window",
-					emptyCycles
-				))
-			end
-			-- A trade that just closed needs a moment before the next request.
-			waitSeconds(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
-		else
-			waitSeconds(CONFIG.NEXT_CYCLE_DELAY_SECONDS)
-		end
-	end
-
-	-- Said a few times, because the relay is allowed to refuse and the joiner's
-	-- card is nicer when it knows. Nothing depends on it: a joiner that never
-	-- hears it simply waits for a request that is not coming.
-	for _ = 1, 3 do
-		publishSync("done", targetUsername, cycle, tostring(traded))
-		if not state.running then
-			break
-		end
-		waitSeconds(6)
-	end
-	print(string.format("[Trade] finished after %d cycle(s), %d item(s) traded.", cycle, traded))
-	return true
-end
-
---------------------------------------------------------------------------
--- UI
---------------------------------------------------------------------------
-
-THEME = {
-	bg = Color3.fromRGB(16, 17, 22),
+local THEME = {
 	panel = Color3.fromRGB(25, 27, 34),
 	line = Color3.fromRGB(46, 50, 62),
 	text = Color3.fromRGB(233, 236, 242),
 	soft = Color3.fromRGB(146, 152, 167),
-	muted = Color3.fromRGB(108, 113, 126),
-	accent = Color3.fromRGB(106, 141, 255),
 	green = Color3.fromRGB(80, 208, 138),
 	amber = Color3.fromRGB(240, 186, 84),
 	red = Color3.fromRGB(240, 106, 106),
 }
 
-local function create(class, props, children)
-	local instance = Instance.new(class)
-	if props then
-		for key, value in pairs(props) do
+local ui = { gui = nil, status = nil, info = nil, dot = nil }
+
+local function setStatus(text, color)
+	if type(color) == "string" then
+		color = THEME[color] or THEME.amber
+	end
+	if ui.status == nil then
+		return
+	end
+	pcall(function()
+		ui.status.Text = tostring(text)
+		ui.status.TextColor3 = color
+		ui.dot.BackgroundColor3 = color
+	end)
+end
+
+local function setInfo(text)
+	if ui.info == nil then
+		return
+	end
+	pcall(function()
+		ui.info.Text = tostring(text)
+	end)
+end
+
+-- The card only ever reports. It has no buttons, so it cannot cancel a trade,
+-- and every call is wrapped: a game that refuses to create guis gets a console
+-- line instead of a broken session.
+local cardOk, cardErr = pcall(function()
+	local parent = nil
+	if type(gethui) == "function" then
+		local ok, container = pcall(gethui)
+		if ok and container ~= nil then
+			parent = container
+		end
+	end
+	if parent == nil then
+		local ok, core = pcall(function()
+			return game:GetService("CoreGui")
+		end)
+		if ok and core ~= nil then
+			parent = core
+		end
+	end
+	if parent == nil then
+		parent = me:FindFirstChild("PlayerGui")
+	end
+	if parent == nil then
+		return
+	end
+
+	local function create(class, props)
+		local instance = Instance.new(class)
+		for key, value in pairs(props or {}) do
 			if key ~= "Parent" then
 				instance[key] = value
 			end
 		end
-	end
-	if children then
-		for _, child in ipairs(children) do
-			child.Parent = instance
+		if props and props.Parent then
+			instance.Parent = props.Parent
 		end
+		return instance
 	end
-	if props and props.Parent then
-		instance.Parent = props.Parent
+
+	local old = parent:FindFirstChild("TradeJoiner")
+	if old ~= nil then
+		old:Destroy()
 	end
-	return instance
-end
-
-local function corner(parent, radius)
-	return create("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
-end
-
-local function stroke(parent, color)
-	return create("UIStroke", {
-		Color = color,
-		Thickness = 1,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-		Parent = parent,
-	})
-end
-
-local function resolveGuiParent()
-	if type(gethui) == "function" then
-		local ok, container = pcall(gethui)
-		if ok and typeof(container) == "Instance" then
-			return container
-		end
-	end
-	local ok, core = pcall(function()
-		return game:GetService("CoreGui")
-	end)
-	if ok and core then
-		return core
-	end
-	return localPlayer:WaitForChild("PlayerGui")
-end
-
-local function destroyPrevious()
-	for _, name in ipairs({ "ServerShareHost", "ServerShareJoiner" }) do
-		local ok = pcall(function()
-			local core = game:GetService("CoreGui")
-			local old = core:FindFirstChild(name)
-			if old then
-				old:Destroy()
-			end
-		end)
-		if not ok then
-			break
-		end
-	end
-	pcall(function()
-		local gui = localPlayer:FindFirstChild("PlayerGui")
-		if gui then
-			for _, name in ipairs({ "ServerShareHost", "ServerShareJoiner" }) do
-				local old = gui:FindFirstChild(name)
-				if old then
-					old:Destroy()
-				end
-			end
-		end
-	end)
-end
-
-local function buildUI()
-	destroyPrevious()
 
 	local gui = create("ScreenGui", {
-		Name = "ServerShareHost",
+		Name = "TradeJoiner",
 		ResetOnSpawn = false,
 		IgnoreGuiInset = true,
 		DisplayOrder = 50,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		Parent = resolveGuiParent(),
+		Parent = parent,
 	})
 
 	local card = create("Frame", {
 		Name = "Card",
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -16, 0, 16),
-		Size = UDim2.fromOffset(320, 216),
+		Position = UDim2.fromOffset(16, 16),
+		Size = UDim2.fromOffset(272, 62),
 		BackgroundColor3 = THEME.panel,
 		BorderSizePixel = 0,
 		Parent = gui,
 	})
-	corner(card, 12)
-	stroke(card, THEME.line)
-
-	local header = create("TextButton", {
-		Name = "Header",
-		Size = UDim2.new(1, 0, 0, 32),
-		BackgroundTransparency = 1,
-		AutoButtonColor = false,
-		Text = "",
+	create("UICorner", { CornerRadius = UDim.new(0, 10), Parent = card })
+	create("UIStroke", {
+		Color = THEME.line,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 		Parent = card,
 	})
+
 	create("TextLabel", {
-		Size = UDim2.new(1, -24, 1, 0),
-		Position = UDim2.fromOffset(14, 0),
+		Name = "Title",
+		Position = UDim2.fromOffset(12, 8),
+		Size = UDim2.new(1, -32, 0, 14),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamBold,
-		TextSize = 13,
+		TextSize = 12,
 		TextColor3 = THEME.text,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "SHARING + AUTO TRADE",
-		Parent = header,
+		Text = "TRADE JOINER",
+		Parent = card,
 	})
 
-	local dot = create("Frame", {
+	ui.dot = create("Frame", {
 		Name = "Dot",
-		Position = UDim2.new(1, -20, 0, 12),
+		Position = UDim2.new(1, -20, 0, 11),
 		Size = UDim2.fromOffset(8, 8),
 		BackgroundColor3 = THEME.amber,
 		BorderSizePixel = 0,
 		Parent = card,
 	})
-	corner(dot, 99)
+	create("UICorner", { CornerRadius = UDim.new(1, 0), Parent = ui.dot })
 
-	local infoLabel = create("TextLabel", {
-		Name = "Info",
-		Position = UDim2.fromOffset(14, 34),
-		Size = UDim2.new(1, -28, 0, 84),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Code,
-		TextSize = 11,
-		TextColor3 = THEME.soft,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		TextWrapped = true,
-		Text = "Reading server info...",
-		Parent = card,
-	})
-
-	local statusLabel = create("TextLabel", {
+	ui.status = create("TextLabel", {
 		Name = "Status",
-		Position = UDim2.fromOffset(14, 120),
-		Size = UDim2.new(1, -28, 0, 42),
+		Position = UDim2.fromOffset(12, 26),
+		Size = UDim2.new(1, -24, 0, 16),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamMedium,
 		TextSize = 11,
 		TextColor3 = THEME.amber,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		TextWrapped = true,
-		Text = "Starting...",
+		Text = "Connecting...",
 		Parent = card,
 	})
 
-	local stopButton = create("TextButton", {
-		Name = "Stop",
-		AnchorPoint = Vector2.new(0, 1),
-		Position = UDim2.new(0, 14, 1, -12),
-		Size = UDim2.fromOffset(84, 24),
-		BackgroundColor3 = THEME.panel,
-		AutoButtonColor = false,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 11,
+	ui.info = create("TextLabel", {
+		Name = "Info",
+		Position = UDim2.fromOffset(12, 42),
+		Size = UDim2.new(1, -24, 0, 14),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Code,
+		TextSize = 10,
 		TextColor3 = THEME.soft,
-		Text = "Stop",
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
 		Parent = card,
 	})
-	corner(stopButton, 6)
-	stroke(stopButton, THEME.line)
 
-	local tradeButton = create("TextButton", {
-		Name = "Trade",
-		AnchorPoint = Vector2.new(0, 1),
-		Position = UDim2.new(0, 106, 1, -12),
-		Size = UDim2.fromOffset(94, 24),
-		BackgroundColor3 = THEME.panel,
-		AutoButtonColor = false,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 11,
-		TextColor3 = THEME.soft,
-		Text = "Run trade",
-		Parent = card,
-	})
-	corner(tradeButton, 6)
-	stroke(tradeButton, THEME.line)
-
-	local copyButton = create("TextButton", {
-		Name = "Copy",
-		AnchorPoint = Vector2.new(1, 1),
-		Position = UDim2.new(1, -14, 1, -12),
-		Size = UDim2.fromOffset(96, 24),
-		BackgroundColor3 = THEME.panel,
-		AutoButtonColor = false,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 11,
-		TextColor3 = THEME.soft,
-		Text = "Copy Job ID",
-		Parent = card,
-	})
-	corner(copyButton, 6)
-	stroke(copyButton, THEME.line)
-
-	-- Drag from the header.
-	local dragging = false
-	local dragStart, startPosition
-	header.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = input.Position
-			startPosition = card.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-				end
-			end)
-		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
-		if not dragging then
-			return
-		end
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			local delta = input.Position - dragStart
-			card.Position = UDim2.new(
-				startPosition.X.Scale,
-				startPosition.X.Offset + delta.X,
-				startPosition.Y.Scale,
-				startPosition.Y.Offset + delta.Y
-			)
-		end
-	end)
-
-	return {
-		gui = gui,
-		card = card,
-		dot = dot,
-		info = infoLabel,
-		status = statusLabel,
-		stop = stopButton,
-		trade = tradeButton,
-		copy = copyButton,
-	}
-end
-
-ui = buildUI()
-
---------------------------------------------------------------------------
--- Who is running this script
---------------------------------------------------------------------------
-
-
-local gameName = cleanText(tostring(game.Name or ""), 60)
-if gameName == "" then
-	gameName = "Unknown game"
-end
-
-local hostDisplay = cleanText(tostring(localPlayer.DisplayName or localPlayer.Name or ""), 40)
-if hostDisplay == "" then
-	hostDisplay = "Unknown player"
-end
-
-local hostUsername = cleanText(tostring(localPlayer.Name or ""), 40)
-if hostUsername == "" then
-	hostUsername = "Unknown player"
-end
-
-local placeId = tonumber(game.PlaceId) or 0
-
---------------------------------------------------------------------------
--- State
---------------------------------------------------------------------------
-
-
-state = {
-	running = true,
-	active = nil,     -- { username, display, firstSeen }
-	tradeStarted = false,
-	tradeRunning = false,
-	tradeTarget = nil,
-	finished = false,
-}
-
-setStatus = function(text, color)
-	ui.status.Text = text
-	ui.status.TextColor3 = color
-	ui.dot.BackgroundColor3 = color
-end
-
-updateInfo = function()
-	local lines = {
-		"Host: " .. hostDisplay .. " (@" .. hostUsername .. ")",
-		"Game: " .. gameName,
-		"Place: " .. tostring(tonumber(game.PlaceId) or placeId),
-		"Job: " .. (currentJobId() == "" and "not available yet" or currentJobId()),
-	}
-
-	if state.tradeTarget ~= nil then
-		lines[#lines + 1] = "CONNECTED: " .. state.tradeTarget .. (state.finished and " (finished)" or " (trading now)")
-	elseif state.active ~= nil then
-		lines[#lines + 1] = "CONNECTED: " .. state.active.username
-	else
-		lines[#lines + 1] = "NOT CONNECTED: nobody else in this server yet"
-	end
-
-	lines[#lines + 1] = "Link: " .. linkState()
-	ui.info.Text = table.concat(lines, "\n")
-end
-
---------------------------------------------------------------------------
--- Who to trade with
---------------------------------------------------------------------------
-
---
--- Nothing joins anybody: both people are already in this server. The other side
--- of the trade is simply the other player in the Players list, so there is no
--- handshake to wait for - the username the trade request needs is read straight
--- from the game.
-
-local function findPlayerByUsername(username)
-	local wanted = tostring(username):lower()
-	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= localPlayer and player.Name:lower() == wanted then
-			return player
-		end
-	end
-	return nil
-end
-
--- The other person in this server: with one host and one joiner that is the
--- side this one trades with.
-local function theOtherPlayer()
-	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= localPlayer then
-			return player
-		end
-	end
-	return nil
-end
-
--- CONFIG.TARGET pins a username; otherwise it is whoever else is here.
-local function resolveTarget()
-	if CONFIG.TARGET ~= nil and tostring(CONFIG.TARGET) ~= "" then
-		return findPlayerByUsername(tostring(CONFIG.TARGET))
-	end
-	-- Whoever the link heard from first, as long as they are really here (the
-	-- link only believes players standing in this server), then simply whoever
-	-- else is here.
-	if link.peerUsername ~= "" then
-		local linked = findPlayerByUsername(link.peerUsername)
-		if linked ~= nil then
-			return linked
-		end
-	end
-	return theOtherPlayer()
-end
-
---------------------------------------------------------------------------
--- Running the coordinated trade loop with the joiner
---------------------------------------------------------------------------
-
-
-local function runTrade(targetPlayer, targetUsername)
-	if state.tradeStarted then
-		setStatus("The trade loop is already running for " .. tostring(state.tradeTarget) .. ".", THEME.amber)
-		return false
-	end
-
-	if targetPlayer == nil or targetPlayer.Parent == nil then
-		setStatus("That player is not in this server any more.", THEME.red)
-		return false
-	end
-
-	state.tradeStarted = true
-	state.tradeTarget = targetUsername
-	ui.trade.Text = "Trading..."
-	print("[Server Share] starting the coordinated trade loop with " .. targetUsername)
-
-	spawnThread(function()
-		local ok, result = pcall(runTradeLoop, targetPlayer, targetUsername)
-		if not ok then
-			state.tradeStarted = false
-			state.tradeRunning = false
-			state.tradeTarget = nil
-			ui.trade.Text = "Run trade"
-			print("[Server Share] trade loop stopped: " .. tostring(result))
-			setStatus("Trade loop stopped: " .. tostring(result), THEME.red)
-			updateInfo()
-			return
-		end
-
-		state.tradeRunning = false
-		state.finished = true
-		ui.trade.Text = "Finished"
-		setStatus(
-			"Done. Every tradable item is gone; only the Default Gun and Default Knife are left.",
-			THEME.green
-		)
-		updateInfo()
-	end)
-
-	updateInfo()
-	setStatus("Trading with " .. targetUsername .. " now.", THEME.green)
-	return true
-end
-
---------------------------------------------------------------------------
--- Buttons
---------------------------------------------------------------------------
-
-
-ui.stop.MouseButton1Click:Connect(function()
-	state.running = false
-	ui.gui:Destroy()
-	print("[Trade] stopped, channel " .. channelCode)
+	ui.gui = gui
 end)
 
-ui.trade.MouseButton1Click:Connect(function()
-	if state.tradeStarted then
-		setStatus("The trade loop is already running for " .. tostring(state.tradeTarget) .. ".", THEME.amber)
-		return
-	end
-	local target = resolveTarget()
-	if target ~= nil then
-		runTrade(target, target.Name)
-		return
-	end
-	setStatus("Nobody else is in this server yet.", THEME.amber)
-end)
-
-ui.copy.MouseButton1Click:Connect(function()
-	local copied = false
-	local environment = type(getgenv) == "function" and getgenv() or _G
-	for _, name in ipairs({ "setclipboard", "toclipboard" }) do
-		local fn = rawget(environment, name)
-		if type(fn) == "function" then
-			local ok = pcall(fn, room)
-			copied = copied or ok
-		end
-	end
-	ui.copy.Text = copied and "Copied" or "Copy failed"
-	waitSeconds(1.2)
-	if ui.gui.Parent then
-		ui.copy.Text = "Copy Room"
-	end
-end)
-
---------------------------------------------------------------------------
--- Start
---------------------------------------------------------------------------
-
-
-if not httpAvailable then
-	setStatus("This executor does not expose HTTP requests, so it cannot talk to the joiner.", THEME.red)
-	print("[Trade] this executor does not expose HTTP requests")
-	return
+if not cardOk then
+	print("[Trade] could not draw the card: " .. tostring(cardErr))
 end
 
-updateInfo()
-setStatus("Starting...", THEME.amber)
+cardStatus = setStatus
+cardInfo = setInfo
 
--- The link runs from the first second, so CONNECTED can be said the moment
--- the other script says hello - and the trade starts right then.
+findTheHost()
+
+setStatus("CONNECTED to " .. hostDisplay .. " (" .. hostUsername .. ")", THEME.green)
+setInfo("Waiting for the host's trade request")
+print("[Trade] CONNECTED to " .. hostDisplay .. " (" .. hostUsername .. ") - waiting for the trade request")
+print("[Trade] link: " .. linkState() .. " - the relay is only a helper, the trade runs on the trade window and the clock")
+
+--------------------------------------------------------------------------
+-- Trade driver
+--------------------------------------------------------------------------
+
+-- Say hello on the channel straight away: that hello is what makes the host
+-- say CONNECTED and start the trade. The host needs no timer of its own.
 startRelayLoop()
+print("[Trade] link: " .. linkState() .. " (channel " .. channelCode .. ")")
 
-spawnThread(function()
-	local announced = false
-	local otherSince = nil
-	while state.running and not state.tradeStarted do
-		local linked = link.connected and findPlayerByUsername(link.peerUsername) ~= nil
-		local target = resolveTarget()
+print(string.format(
+	"[Trade] session %s running in place %s, job %s, host %s",
+	BUILD,
+	tostring(game.PlaceId),
+	tostring(myJob),
+	tostring(hostDisplay)
+))
 
-		if target ~= nil then
-			if otherSince == nil then
-				otherSince = nowSeconds()
-			end
-			-- The link's hello is the proof that both scripts are running. Without
-			-- it (relay busy, or the other side still loading) the trade starts
-			-- anyway: no step of it needs the relay.
-			if linked or nowSeconds() - otherSince >= CONFIG.LINK_FALLBACK_SECONDS then
-				if linked then
-					print("[Trade] CONNECTED to " .. target.Name .. " over the link - starting the trade now")
+-- A wrong path would mean the press happens nowhere, so the real contents of
+-- this client's trade window are printed once. It also proves the script never
+-- hides or deletes anything: every element listed is still there.
+local treeDumped = false
+local function dumpTradeTree()
+	if treeDumped then
+		return
+	end
+	local root = tradeGui()
+	if root == nil then
+		return
+	end
+	treeDumped = true
+	local lines = {}
+	local function walk(instance, depth, prefix)
+		if depth > 4 or #lines > 40 then
+			return
+		end
+		local ok, children = pcall(function()
+			return instance:GetChildren()
+		end)
+		if not ok or children == nil then
+			return
+		end
+		for _, child in ipairs(children) do
+			lines[#lines + 1] = prefix .. tostring(child.Name)
+			walk(child, depth + 1, prefix .. "  ")
+		end
+	end
+	walk(root, 1, "  ")
+	print("[Trade] TradeGUI contents:\n" .. table.concat(lines, "\n"))
+end
+
+-- List the trade remotes once, so the console shows what the game exposes.
+-- If you ever need to press accept or confirm through a remote instead of a
+-- button, this is the list to look at.
+do
+	local ok, folder = pcall(function()
+		return ReplicatedStorage:FindFirstChild("Trade")
+	end)
+	if ok and folder ~= nil then
+		local names = {}
+		for _, child in ipairs(folder:GetChildren()) do
+			names[#names + 1] = tostring(child.Name)
+		end
+		print("[Trade] Trade remotes: " .. table.concat(names, ", "))
+	else
+		print("[Trade] ReplicatedStorage.Trade was not found")
+	end
+end
+
+-- One full trade with the host, from an open trade window to a confirmed
+-- trade. Returns "ok" when the cycle completed, "retry" when it has to be
+-- handed back to the host, and "stop" when this session is over.
+local function runWindowTrade(cycleNumber)
+	dumpTradeTree()
+	print("[Trade] cycle " .. tostring(cycleNumber) .. ": the trade window is open - the host's request landed")
+
+	-- Watch the window for the rest of the cycle, so the console says exactly
+	-- when and why it went away instead of leaving it to guesswork.
+	local windowOpenedAt = now()
+	local acceptPressedAt = nil
+	local watchWindow = true
+	spawnFn(function()
+		local wasOpen = tradeGui() ~= nil
+		while watchWindow and not finished do
+			local isOpen = tradeGui() ~= nil
+			if wasOpen and not isOpen then
+				local sinceOpen = now() - windowOpenedAt
+				if acceptPressedAt ~= nil then
+					print(string.format(
+						"[Trade] cycle %d: the trade window closed %.1fs after it opened, %.1fs after the accept press",
+						cycleNumber,
+						sinceOpen,
+						now() - acceptPressedAt
+					))
 				else
-					print("[Trade] CONNECTED to " .. target.Name .. " (same server, the relay has not answered) - starting the trade anyway")
-				end
-				setStatus("CONNECTED to " .. target.Name .. " - starting the trade", THEME.green)
-				state.active = { username = target.Name }
-				updateInfo()
-				waitSeconds(CONFIG.TRADE_START_DELAY_SECONDS)
-				if state.running and not state.tradeStarted then
-					local again = resolveTarget()
-					if again ~= nil then
-						state.active = { username = again.Name }
-						runTrade(again, again.Name)
-					end
+					print(string.format(
+						"[Trade] cycle %d: the trade window closed %.1fs after it opened, before accept was pressed",
+						cycleNumber,
+						sinceOpen
+					))
 				end
 				return
 			end
-		else
-			otherSince = nil
-			if not announced then
-				announced = true
-				print("[Trade] waiting for the other person to be in this server (both scripts must be in the SAME server)")
-				setStatus("NOT CONNECTED - waiting for the other person. Both scripts must be in the SAME server.", THEME.amber)
-			end
+			wasOpen = isOpen
+			waitFn(0.1)
 		end
+	end)
 
-		waitSeconds(0.25)
+	-- The host adds its items 2s after this side accepted. This side watches its
+	-- own window for them, which is the same moment the host sees, so both sides
+	-- count from the same event instead of drifting apart.
+	print("[Trade] cycle " .. tostring(cycleNumber) .. ": waiting for the host to add its items")
+	setStatus(string.format("Cycle %d: waiting for the host's items", cycleNumber), THEME.amber)
+	local itemReason, itemsInAt = waitForHostItems(cycleNumber)
+	if itemReason == "stopped" then
+		watchWindow = false
+		return "stop"
 	end
-end)
+	if itemReason == "window closed" then
+		-- The trade was cancelled before any item went in. Hand the same cycle
+		-- back to the host instead of losing it.
+		watchWindow = false
+		print("[Trade] cycle " .. tostring(cycleNumber) .. ": the trade window closed before the host added anything - starting over")
+		tellNowindow(cycleNumber)
+		return "retry"
+	end
+
+	local itemNote = "the host's items are in"
+	if itemReason == "relay" then
+		itemNote = "the host says its items are in"
+	elseif itemReason == "timer" then
+		itemNote = "no items visible here, going by the clock"
+	end
+	print(string.format("[Trade] cycle %d: %s", cycleNumber, itemNote))
+
+	-- The host presses accept six seconds after its last item. Both clients saw
+	-- that item land, so this side can press one second after the host's moment
+	-- without waiting for a message. That is the whole point: the presses stay in
+	-- the right order even when the relay is not answering.
+	local goAt = itemsInAt + ACCEPT_DELAY + ACCEPT_GO_DELAY
+
+	if itemReason == "timer" then
+		-- Nothing showed up in the window here, so the host's own word is the
+		-- only clock there is. It is used if it comes; the deadline holds anyway.
+		while not finished and now() < goAt do
+			local entry = sync.events["acceptgo"]
+			if entry ~= nil and entry.cycle >= cycleNumber then
+				goAt = math.min(goAt, now() + ACCEPT_GO_DELAY)
+				print("[Trade] cycle " .. tostring(cycleNumber) .. ": the host says it is accepting now")
+				break
+			end
+			waitFn(0.2)
+		end
+	end
+
+	print(string.format(
+		"[Trade] cycle %d: accepting in %.1fs (the host presses 1s before that)",
+		cycleNumber,
+		math.max(0, goAt - now())
+	))
+	while not finished and now() < goAt do
+		setStatus(string.format("Cycle %d: accepting in %ss...", cycleNumber, tostring(math.ceil(math.max(0, goAt - now())))), THEME.green)
+		waitFn(math.min(0.2, math.max(0, goAt - now())))
+	end
+	if finished then
+		watchWindow = false
+		return "stop"
+	end
+
+	acceptPressedAt = now()
+	setStatus(string.format("Cycle %d: pressing accept...", cycleNumber), THEME.green)
+	local accepted, acceptSignal = acceptTheTrade()
+	if not accepted then
+		-- This side never actually agreed to the items, so confirming would only
+		-- close (or cancel) a trade nobody agreed to. Hand the cycle back.
+		print(string.format(
+			"[Trade] cycle %d: the items were NOT accepted (%s) - not confirming",
+			cycleNumber,
+			tostring(acceptSignal)
+		))
+		publish("accept", cycleNumber, "notaccepted")
+		watchWindow = false
+		return "retry"
+	end
+	print(string.format("[Trade] cycle %d: accepted the items (%s)", cycleNumber, tostring(acceptSignal)))
+	publish("accept", cycleNumber, "ok")
+
+	waitFn(CONFIRM_DELAY)
+	setStatus(string.format("Cycle %d: confirmed, waiting for the trade to close", cycleNumber), THEME.green)
+	local confirmed, confirmSignal = pressConfirm()
+	if confirmed then
+		print(string.format("[Trade] cycle %d: pressed confirm once (%s)", cycleNumber, tostring(confirmSignal)))
+	end
+
+	-- A trade only completes when both sides confirm, so if the window is still
+	-- up a few seconds later the host's confirm had not landed yet. Press once
+	-- more rather than leaving this side half-done.
+	local recheck = now() + 4
+	while not finished and now() < recheck and tradeGui() ~= nil do
+		waitFn(0.25)
+	end
+	if tradeGui() ~= nil then
+		print("[Trade] cycle " .. tostring(cycleNumber) .. ": the window is still open - pressing confirm once more")
+		pressConfirm()
+	end
+
+	-- The window closing is what ends this cycle, and the host sends the next
+	-- request about half a second after it.
+	local closedBy = now() + 5
+	while not finished and now() < closedBy and tradeGui() ~= nil do
+		waitFn(0.2)
+	end
+	watchWindow = false
+
+	print(string.format("=== cycle %d finished ===", cycleNumber))
+	return "ok"
+end
+
+-- The cycle loop. Every request the host sends starts one cycle, and a cycle
+-- that never became a trade is handed back to the host instead of being lost:
+-- it sends the same request again and this side picks it straight back up.
+local cycle = 0
+while not finished do
+	local wanted = cycle + 1
+
+	local trigger = waitForRequest(wanted)
+	if trigger == nil then
+		break
+	end
+
+	print(string.format("[Trade] cycle %d: the host sent the request (%s) - accepting it in %ss", wanted, trigger, tostring(REQUEST_DELAY)))
+	setStatus(string.format("Cycle %d: host sent the request - accepting", wanted), THEME.amber)
+	-- A fresh request means a fresh attempt: the previous attempt's "items"
+	-- message must not be mistaken for this one's.
+	sync.events["items"] = nil
+	sync.events["acceptgo"] = nil
+	waitFn(REQUEST_DELAY)
+	fireAcceptRequest()
+
+	-- The host waits for this before it adds anything: it is the proof that the
+	-- trade window really opened, so its items land in a live trade instead of
+	-- going into a request that never got through.
+	local windowOpen = waitForTradeWindow(WINDOW_WAIT)
+	if not windowOpen then
+		-- The request expired, or the accept never reached the game. Try the
+		-- accept once more before handing the cycle back: a request that is
+		-- still pending does not need a brand new one.
+		print("[Trade] cycle " .. tostring(wanted) .. ": the trade window did not open - asking the host to send it again")
+		tellNowindow(wanted)
+		waitFn(REQUEST_RETRY_SECONDS)
+		fireAcceptRequest()
+		windowOpen = waitForTradeWindow(WINDOW_WAIT)
+	end
+
+	if not windowOpen then
+		-- Stay on this cycle number: the host resends the request under the same
+		-- number, and the next wait treats that message as a new request.
+		print("[Trade] cycle " .. tostring(wanted) .. ": still no trade window - waiting for the host's next request")
+		tellNowindow(wanted)
+		waitFn(REQUEST_RETRY_WAIT)
+	else
+		-- Tell the host the request is accepted, so it starts its own 2 second
+		-- wait. Its window opens at the same instant, so a message lost to the
+		-- relay's rate limit costs nothing: the host sees the same window.
+		publish("reqok", wanted, "open")
+		print("[Trade] cycle " .. tostring(wanted) .. ": told the host the request was accepted")
+		setInfo(string.format("Cycle %d: trade open - waiting for the host's items", wanted))
+
+		local outcome = runWindowTrade(wanted)
+		if outcome == "stop" then
+			break
+		elseif outcome == "retry" then
+			-- Same cycle number: the host resends the request under it.
+			waitFn(REQUEST_RETRY_WAIT)
+		else
+			cycle = wanted
+		end
+	end
+end
+
+--------------------------------------------------------------------------
+-- That is the end of the run
+--------------------------------------------------------------------------
+
+
+if finished then
+	print("[Trade] every cycle is done - the host has nothing left to give")
+	setStatus("Finished - every item is traded", THEME.green)
+	setInfo("The host has nothing left to give")
+else
+	print("[Trade] the host went quiet or this session was stopped")
+	setStatus("Stopped - the host went quiet", THEME.amber)
+end
